@@ -1,8 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+import json
 from typing import Any, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import (
     Boolean,
     Column,
@@ -86,6 +87,7 @@ class SubmissionModel(Base):
     pr_url = Column(String(500), nullable=False)
     code_diff = Column(Text, nullable=False)  # Frozen immutable code diff from PR or pre-seeded fixture
     commit_sha = Column(String(100), nullable=True)  # Git commit SHA
+    diff_source = Column(String(50), default="preseeded_fixture", nullable=False)  # "github_pr_diff" or "preseeded_fixture"
     status = Column(String(50), default=SubmissionStatus.PENDING.value, nullable=False, index=True)
     ci_passed = Column(Boolean, default=False, nullable=False)
     maintainer_approved = Column(Boolean, default=False, nullable=False)
@@ -149,12 +151,25 @@ class AuditEventModel(Base):
 
 # --- Pydantic Schemas ---
 
+class AcceptanceCriteria(BaseModel):
+    required_symbols: list[str] = Field(default_factory=list, description="Function or class names required in the submission")
+    forbidden_symbols: list[str] = Field(default_factory=list, description="Disallowed patterns or functions")
+    min_score: float = Field(default=0.85, ge=0.0, le=1.0, description="Minimum AI review score required")
+
+
 class BountyCreate(BaseModel):
     title: str = Field(..., max_length=255)
     description: Optional[str] = None
     amount: Decimal = Field(..., gt=Decimal("0.00"), decimal_places=2)
     currency: str = Field(default="USD", max_length=3)
-    test_suite_spec: Optional[str] = Field(default=None, description="Maintainer-defined acceptance test spec (JSON)")
+    acceptance_criteria: Optional[AcceptanceCriteria] = None
+    test_suite_spec: Optional[str] = None
+
+    @model_validator(mode="after")
+    def populate_test_suite_spec(self) -> "BountyCreate":
+        if self.acceptance_criteria and not self.test_suite_spec:
+            self.test_suite_spec = json.dumps(self.acceptance_criteria.model_dump())
+        return self
 
 
 class BountyRead(BaseModel):
@@ -174,10 +189,9 @@ class SubmissionCreate(BaseModel):
     bounty_id: int
     contributor_email: str
     pr_url: str
-    code_diff: str = Field(
-        ...,
-        min_length=1,
-        description="Frozen code diff from the submitted pull request or verified fixture",
+    code_diff: Optional[str] = Field(
+        default=None,
+        description="Frozen code diff from the submitted pull request or pre-seeded verified fixture",
     )
     commit_sha: Optional[str] = Field(default=None, description="Git commit SHA from the pull request")
 
@@ -191,10 +205,16 @@ class SubmissionRead(BaseModel):
     pr_url: str
     code_diff: str
     commit_sha: Optional[str] = None
+    diff_source: str
     status: str
     ci_passed: bool
     maintainer_approved: bool
     created_at: datetime
+
+
+class MaintainerApprovalRequest(BaseModel):
+    approved: bool = Field(default=True, description="Whether maintainer approves the submission for payout")
+    notes: Optional[str] = Field(default=None, description="Maintainer review feedback or sign-off notes")
 
 
 class AIReviewAssessment(BaseModel):

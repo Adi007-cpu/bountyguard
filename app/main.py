@@ -1,6 +1,10 @@
 from contextlib import asynccontextmanager
+import json
+import os
 from typing import Any, List, Optional
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import HTMLResponse
+import httpx
 from sqlalchemy.orm import Session
 
 from app.database import get_db, init_db
@@ -9,6 +13,7 @@ from app.models import (
     BountyCreate,
     BountyModel,
     BountyRead,
+    MaintainerApprovalRequest,
     PayoutExecuteRequest,
     PayoutModel,
     PayoutRead,
@@ -20,6 +25,7 @@ from app.models import (
     SubmissionModel,
     SubmissionRead,
 )
+from app.seed import seed_demo_scenarios
 from app.services.ai_reviewer import AIReviewer
 from app.services.paypal import PayPalPayoutError, PayPalService
 from app.services.payout_orchestrator import (
@@ -29,6 +35,8 @@ from app.services.payout_orchestrator import (
 )
 from app.services.policy import PolicyEngine
 from app.services.test_runner import FixtureTestRunner, TestExecutionResult
+
+MAINTAINER_TOKEN = os.getenv("MAINTAINER_TOKEN", "bountyguard-maintainer-secret")
 
 
 @asynccontextmanager
@@ -40,7 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="BountyGuard API",
     description="Automated server-side policy validation, LLM AI code review, and secure PayPal payouts for developer bounties",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -53,7 +61,13 @@ test_runner = FixtureTestRunner()
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "BountyGuard API", "version": "0.3.0"}
+    return {
+        "status": "ok",
+        "service": "BountyGuard API",
+        "version": "0.4.0",
+        "dashboard_url": "/dashboard",
+        "docs_url": "/docs",
+    }
 
 
 @app.get("/health")
@@ -65,7 +79,7 @@ def health_check():
 
 @app.post("/bounties", response_model=BountyRead, status_code=status.HTTP_201_CREATED)
 def create_bounty(bounty_in: BountyCreate, db: Session = Depends(get_db)):
-    """Creates a bounty. The maintainer can optionally provide a test_suite_spec JSON."""
+    """Creates a bounty. Maintainers can define test_suite_spec or acceptance_criteria."""
     bounty = BountyModel(
         title=bounty_in.title,
         description=bounty_in.description,
@@ -79,6 +93,11 @@ def create_bounty(bounty_in: BountyCreate, db: Session = Depends(get_db)):
     return bounty
 
 
+@app.get("/bounties", response_model=List[BountyRead])
+def list_bounties(db: Session = Depends(get_db)):
+    return db.query(BountyModel).order_by(BountyModel.id.desc()).all()
+
+
 @app.get("/bounties/{bounty_id}", response_model=BountyRead)
 def get_bounty(bounty_id: int, db: Session = Depends(get_db)):
     bounty = db.query(BountyModel).filter(BountyModel.id == bounty_id).first()
@@ -90,23 +109,54 @@ def get_bounty(bounty_id: int, db: Session = Depends(get_db)):
 # --- Submission Endpoints ---
 
 @app.post("/submissions", response_model=SubmissionRead, status_code=status.HTTP_201_CREATED)
-def create_submission(sub_in: SubmissionCreate, db: Session = Depends(get_db)):
-    """Creates a submission. The code_diff is frozen upon creation (from PR or verified fixture)."""
+async def create_submission(sub_in: SubmissionCreate, db: Session = Depends(get_db)):
+    """Creates a submission. Freezes immutable code diff from PR or pre-seeded verified fixture."""
     bounty = db.query(BountyModel).filter(BountyModel.id == sub_in.bounty_id).first()
     if not bounty:
         raise HTTPException(status_code=404, detail="Bounty not found")
+
+    code_diff = sub_in.code_diff
+    diff_source = "preseeded_fixture"
+
+    # If code_diff was not provided explicitly, attempt to fetch live PR diff from pr_url
+    if not code_diff and sub_in.pr_url:
+        try:
+            # Support GitHub PR URLs e.g. https://github.com/owner/repo/pull/123
+            diff_url = sub_in.pr_url.rstrip("/") + ".diff"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(diff_url, headers={"User-Agent": "BountyGuard-Agent"})
+                if resp.status_code == 200 and resp.text.strip():
+                    code_diff = resp.text
+                    diff_source = "github_pr_diff"
+        except Exception:
+            pass
+
+    if not code_diff or not code_diff.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not retrieve code diff from pr_url. Please provide code_diff directly (or use a demo fixture).",
+        )
 
     submission = SubmissionModel(
         bounty_id=sub_in.bounty_id,
         contributor_email=sub_in.contributor_email,
         pr_url=sub_in.pr_url,
-        code_diff=sub_in.code_diff,
+        code_diff=code_diff,
         commit_sha=sub_in.commit_sha,
+        diff_source=diff_source,
     )
     db.add(submission)
     db.commit()
     db.refresh(submission)
     return submission
+
+
+@app.get("/submissions", response_model=List[SubmissionRead])
+def list_submissions(bounty_id: Optional[int] = None, db: Session = Depends(get_db)):
+    query = db.query(SubmissionModel)
+    if bounty_id:
+        query = query.filter(SubmissionModel.bounty_id == bounty_id)
+    return query.order_by(SubmissionModel.id.desc()).all()
 
 
 @app.get("/submissions/{submission_id}", response_model=SubmissionRead)
@@ -117,6 +167,49 @@ def get_submission(submission_id: int, db: Session = Depends(get_db)):
     return submission
 
 
+# --- Maintainer Approval Endpoint ---
+
+@app.post("/submissions/{submission_id}/maintainer-approval", response_model=SubmissionRead)
+def set_maintainer_approval(
+    submission_id: int,
+    approval: MaintainerApprovalRequest,
+    x_maintainer_token: Optional[str] = Header(None, alias="X-MAINTAINER-TOKEN"),
+    db: Session = Depends(get_db),
+):
+    """Protected maintainer sign-off endpoint. Enforces maintainer token authentication
+    and records an immutable audit event for maintainer approval decisions.
+    """
+    # Enforce maintainer token check
+    if not x_maintainer_token or x_maintainer_token != MAINTAINER_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Invalid or missing X-MAINTAINER-TOKEN header.",
+        )
+
+    submission = db.query(SubmissionModel).filter(SubmissionModel.id == submission_id).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    submission.maintainer_approved = approval.approved
+
+    audit = AuditEventModel(
+        event_type="MAINTAINER_APPROVAL",
+        bounty_id=submission.bounty_id,
+        submission_id=submission.id,
+        details=json.dumps(
+            {
+                "approved": approval.approved,
+                "notes": approval.notes,
+                "token_authenticated": True,
+            }
+        ),
+    )
+    db.add(audit)
+    db.commit()
+    db.refresh(submission)
+    return submission
+
+
 # --- Server-Side Verification: Test Runner & AI Review ---
 
 @app.post("/submissions/{submission_id}/run-tests", response_model=TestExecutionResult)
@@ -124,8 +217,9 @@ def run_submission_tests(
     submission_id: int,
     db: Session = Depends(get_db),
 ):
-    """Runs automated server-side tests against the stored submission code diff and
-    maintainer's bounty acceptance test spec. Does NOT accept caller-supplied test outcomes.
+    """Executes server-side verification suite (diff integrity, AST syntax parsing,
+    static security guardrails, and maintainer's acceptance criteria).
+    Does NOT accept arbitrary untrusted code execution from caller.
     """
     try:
         return test_runner.execute_and_update_submission(
@@ -142,7 +236,7 @@ def run_submission_ai_review(
     db: Session = Depends(get_db),
 ):
     """Executes real Gemini LLM structured code review + static scan on the stored submission
-    and bounty spec. Fails closed if Gemini is unavailable. Does NOT accept arbitrary caller diffs.
+    and bounty spec. Fails closed if Gemini is unavailable. Does NOT accept caller-supplied diffs.
     """
     try:
         review = ai_reviewer.evaluate_and_record_submission(
@@ -178,7 +272,7 @@ async def execute_payout(
 ):
     """Orchestrates guarded payout execution:
     1. Evaluates policy server-side.
-    2. Enforces idempotency via persisted UUID sender_batch_id (reusing original ID on retries).
+    2. Preserves original sender_batch_id idempotency key on retries.
     3. Handles race conditions with DB unique constraint rollback (HTTP 409).
     4. Calls PayPal Payouts API and records PENDING status (not marked SUCCESS prematurely).
     """
@@ -276,3 +370,371 @@ def get_audit_events(
     if submission_id:
         query = query.filter(AuditEventModel.submission_id == submission_id)
     return query.order_by(AuditEventModel.created_at.desc()).all()
+
+
+# --- Demo Seeding Endpoint ---
+
+@app.post("/seed")
+def seed_demo(db: Session = Depends(get_db)):
+    """Seeds the three end-to-end scenarios for hackathon demonstration."""
+    summary = seed_demo_scenarios(db)
+    return {"status": "seeded", "scenarios": summary}
+
+
+# --- Interactive UI Dashboard ---
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def get_dashboard():
+    """Renders the BountyGuard Mission Control dashboard."""
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>BountyGuard | AI Guarded PayPal Payouts</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+    body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #0b0f19; color: #f3f4f6; }
+    pre, code { font-family: 'JetBrains Mono', monospace; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+  <!-- Top Navigation -->
+  <header class="border-b border-gray-800 bg-gray-900/60 backdrop-blur-md sticky top-0 z-50 px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center space-x-3">
+      <div class="h-10 w-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center shadow-lg shadow-blue-500/20">
+        <i class="fa-solid fa-shield-halved text-white text-lg"></i>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold bg-gradient-to-r from-blue-400 via-indigo-300 to-white bg-clip-text text-transparent">BountyGuard</h1>
+        <p class="text-xs text-gray-400">Guarded AI Code Review & Autonomous PayPal Payouts</p>
+      </div>
+    </div>
+    <div class="flex items-center space-x-3">
+      <button onclick="triggerSeed()" class="px-4 py-2 bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/30 text-indigo-300 rounded-lg text-sm font-semibold transition flex items-center space-x-2">
+        <i class="fa-solid fa-wand-magic-sparkles"></i>
+        <span>Seed 3 Demo Scenarios</span>
+      </button>
+      <a href="/docs" target="_blank" class="px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm transition">
+        <i class="fa-solid fa-book-open mr-1"></i> API Docs
+      </a>
+    </div>
+  </header>
+
+  <!-- Main Content Layout -->
+  <main class="flex-1 max-w-7xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <!-- Left Column: Active Bounties & Submissions -->
+    <div class="space-y-6">
+      <div class="bg-gray-900/80 border border-gray-800 rounded-2xl p-5 shadow-xl">
+        <div class="flex justify-between items-center mb-4">
+          <h2 class="text-base font-bold text-gray-200 flex items-center gap-2">
+            <i class="fa-solid fa-coins text-amber-400"></i> Bounties
+          </h2>
+          <span id="bounty-count" class="text-xs bg-gray-800 px-2 py-0.5 rounded text-gray-400 font-mono">0 active</span>
+        </div>
+        <div id="bounties-list" class="space-y-3 max-h-[360px] overflow-y-auto pr-1">
+          <p class="text-xs text-gray-500">Loading bounties...</p>
+        </div>
+      </div>
+
+      <div class="bg-gray-900/80 border border-gray-800 rounded-2xl p-5 shadow-xl">
+        <div class="flex justify-between items-center mb-4">
+          <h2 class="text-base font-bold text-gray-200 flex items-center gap-2">
+            <i class="fa-solid fa-code-pull-request text-blue-400"></i> Submissions
+          </h2>
+          <span id="sub-count" class="text-xs bg-gray-800 px-2 py-0.5 rounded text-gray-400 font-mono">0 total</span>
+        </div>
+        <div id="submissions-list" class="space-y-3 max-h-[360px] overflow-y-auto pr-1">
+          <p class="text-xs text-gray-500">Loading submissions...</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Center Column: Active Inspection, Verification & Policy Guard -->
+    <div class="space-y-6">
+      <div class="bg-gray-900/80 border border-gray-800 rounded-2xl p-5 shadow-xl">
+        <div class="flex justify-between items-center mb-4">
+          <h2 class="text-base font-bold text-gray-200 flex items-center gap-2">
+            <i class="fa-solid fa-microchip text-indigo-400"></i> Active Evaluation
+          </h2>
+          <span id="active-sub-id" class="text-xs font-mono bg-blue-900/40 text-blue-300 border border-blue-800 px-2 py-0.5 rounded">None Selected</span>
+        </div>
+
+        <div id="inspector-panel" class="space-y-4">
+          <div class="bg-gray-950 rounded-xl p-3 border border-gray-800/80 text-xs text-gray-400">
+            Select a submission from the left to inspect its frozen code diff, automated verification suite, and AI review.
+          </div>
+        </div>
+      </div>
+
+      <!-- Policy Engine Guardrails Checklist -->
+      <div class="bg-gray-900/80 border border-gray-800 rounded-2xl p-5 shadow-xl">
+        <h2 class="text-base font-bold text-gray-200 mb-4 flex items-center gap-2">
+          <i class="fa-solid fa-scale-balanced text-emerald-400"></i> Policy Guardrails Checklist
+        </h2>
+        <div id="policy-checklist" class="space-y-2.5 text-sm">
+          <div class="flex items-center justify-between p-2.5 bg-gray-950/60 rounded-lg border border-gray-800/60">
+            <span class="text-gray-300 flex items-center gap-2"><i class="fa-solid fa-vial text-gray-500"></i> Verification Suite (AST & Syntax)</span>
+            <span id="badge-ci" class="text-xs font-mono px-2 py-0.5 rounded bg-gray-800 text-gray-400">Pending</span>
+          </div>
+          <div class="flex items-center justify-between p-2.5 bg-gray-950/60 rounded-lg border border-gray-800/60">
+            <span class="text-gray-300 flex items-center gap-2"><i class="fa-solid fa-robot text-gray-500"></i> Gemini 3.8 Flash AI Review</span>
+            <span id="badge-ai" class="text-xs font-mono px-2 py-0.5 rounded bg-gray-800 text-gray-400">Pending</span>
+          </div>
+          <div class="flex items-center justify-between p-2.5 bg-gray-950/60 rounded-lg border border-gray-800/60">
+            <span class="text-gray-300 flex items-center gap-2"><i class="fa-solid fa-user-check text-gray-500"></i> Maintainer Approval</span>
+            <span id="badge-maintainer" class="text-xs font-mono px-2 py-0.5 rounded bg-gray-800 text-gray-400">Pending</span>
+          </div>
+          <div class="flex items-center justify-between p-2.5 bg-gray-950/60 rounded-lg border border-gray-800/60">
+            <span class="text-gray-300 flex items-center gap-2"><i class="fa-solid fa-fingerprint text-gray-500"></i> Duplicate / Idempotency Check</span>
+            <span id="badge-dup" class="text-xs font-mono px-2 py-0.5 rounded bg-gray-800 text-gray-400">Passed</span>
+          </div>
+        </div>
+
+        <div class="mt-5 pt-4 border-t border-gray-800 flex items-center justify-between">
+          <button id="btn-evaluate" onclick="evaluateActivePolicy()" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-600 text-white font-medium rounded-lg text-sm transition">
+            Evaluate Policy
+          </button>
+          <button id="btn-payout" onclick="executePayout()" disabled class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-800 disabled:text-gray-600 text-white font-medium rounded-lg text-sm transition flex items-center gap-1.5">
+            <i class="fa-brands fa-paypal"></i> Execute Payout
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: Audit Event Timeline -->
+    <div class="space-y-6">
+      <div class="bg-gray-900/80 border border-gray-800 rounded-2xl p-5 shadow-xl flex flex-col h-full">
+        <div class="flex justify-between items-center mb-4">
+          <h2 class="text-base font-bold text-gray-200 flex items-center gap-2">
+            <i class="fa-solid fa-list-check text-purple-400"></i> Audit Event Timeline
+          </h2>
+          <button onclick="loadAuditEvents()" class="text-xs text-gray-400 hover:text-white transition">
+            <i class="fa-solid fa-arrows-rotate"></i>
+          </button>
+        </div>
+        <div id="audit-timeline" class="space-y-3 overflow-y-auto max-h-[760px] pr-1 flex-1">
+          <p class="text-xs text-gray-500">Loading audit trail...</p>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    let activeSubmissionId = null;
+    let activeBountyId = null;
+
+    async function loadBounties() {
+      const res = await fetch('/bounties');
+      const bounties = await res.json();
+      document.getElementById('bounty-count').innerText = `${bounties.length} active`;
+      const container = document.getElementById('bounties-list');
+      container.innerHTML = bounties.map(b => `
+        <div class="p-3 bg-gray-950 hover:bg-gray-800/80 rounded-xl border border-gray-800 cursor-pointer transition" onclick="selectBounty(${b.id})">
+          <div class="flex justify-between items-start">
+            <h3 class="text-sm font-semibold text-gray-200 line-clamp-1">${b.title}</h3>
+            <span class="text-xs font-mono text-emerald-400 font-bold">$${b.amount}</span>
+          </div>
+          <div class="flex justify-between items-center mt-2 text-xs text-gray-500">
+            <span>#${b.id}</span>
+            <span class="px-2 py-0.5 rounded text-[10px] uppercase font-bold ${
+              b.status === 'paid' ? 'bg-emerald-900/50 text-emerald-400' :
+              b.status === 'pending_payout' ? 'bg-amber-900/50 text-amber-400' : 'bg-gray-800 text-gray-400'
+            }">${b.status}</span>
+          </div>
+        </div>
+      `).join('') || '<p class="text-xs text-gray-500">No bounties found. Click Seed.</p>';
+    }
+
+    async function loadSubmissions() {
+      const res = await fetch('/submissions');
+      const subs = await res.json();
+      document.getElementById('sub-count').innerText = `${subs.length} total`;
+      const container = document.getElementById('submissions-list');
+      container.innerHTML = subs.map(s => `
+        <div class="p-3 bg-gray-950 hover:bg-gray-800/80 rounded-xl border border-gray-800 cursor-pointer transition ${activeSubmissionId === s.id ? 'ring-2 ring-blue-500' : ''}" onclick="selectSubmission(${s.id})">
+          <div class="flex justify-between items-start">
+            <span class="text-xs font-mono text-blue-400 font-semibold">PR #${s.id}</span>
+            <span class="text-xs font-mono text-gray-400 line-clamp-1">${s.contributor_email}</span>
+          </div>
+          <div class="flex items-center gap-2 mt-2">
+            <span class="text-[10px] px-1.5 py-0.5 rounded ${s.ci_passed ? 'bg-emerald-900/40 text-emerald-300' : 'bg-red-900/40 text-red-300'}">CI: ${s.ci_passed ? 'PASS' : 'FAIL'}</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded ${s.maintainer_approved ? 'bg-emerald-900/40 text-emerald-300' : 'bg-amber-900/40 text-amber-300'}">Approval: ${s.maintainer_approved ? 'YES' : 'NO'}</span>
+          </div>
+        </div>
+      `).join('') || '<p class="text-xs text-gray-500">No submissions found. Click Seed.</p>';
+    }
+
+    async function selectSubmission(id) {
+      activeSubmissionId = id;
+      document.getElementById('active-sub-id').innerText = `Submission #${id}`;
+      const res = await fetch(`/submissions/${id}`);
+      const sub = await res.json();
+      activeBountyId = sub.bounty_id;
+
+      const inspector = document.getElementById('inspector-panel');
+      inspector.innerHTML = `
+        <div class="space-y-3">
+          <div class="flex justify-between items-center text-xs">
+            <span class="text-gray-400">Contributor:</span>
+            <span class="font-mono text-gray-200">${sub.contributor_email}</span>
+          </div>
+          <div class="flex justify-between items-center text-xs">
+            <span class="text-gray-400">Diff Source:</span>
+            <span class="font-mono px-2 py-0.5 rounded bg-gray-800 text-indigo-300">${sub.diff_source}</span>
+          </div>
+          <div>
+            <div class="flex justify-between text-xs text-gray-400 mb-1">
+              <span>Frozen Code Diff:</span>
+              <span class="font-mono text-[10px]">SHA: ${sub.commit_sha || 'N/A'}</span>
+            </div>
+            <pre class="bg-gray-950 p-2.5 rounded-lg border border-gray-800 text-[11px] text-gray-300 max-h-36 overflow-auto font-mono whitespace-pre">${escapeHtml(sub.code_diff)}</pre>
+          </div>
+          <div class="grid grid-cols-2 gap-2 pt-2">
+            <button onclick="runVerificationSuite(${id})" class="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-xs font-semibold rounded-lg text-gray-200 transition">
+              Run Verification Suite
+            </button>
+            <button onclick="runAIReview(${id})" class="px-3 py-1.5 bg-indigo-900/40 hover:bg-indigo-900/60 border border-indigo-700 text-xs font-semibold rounded-lg text-indigo-200 transition">
+              Run Gemini AI Review
+            </button>
+          </div>
+          <div class="pt-2">
+            <button onclick="approveMaintainer(${id})" class="w-full px-3 py-1.5 bg-emerald-900/30 hover:bg-emerald-900/50 border border-emerald-700 text-xs font-semibold rounded-lg text-emerald-300 transition">
+              Maintainer Sign-Off (Token Auth)
+            </button>
+          </div>
+        </div>
+      `;
+
+      updateChecklistUI(sub);
+      loadSubmissions();
+    }
+
+    function updateChecklistUI(sub) {
+      const ciBadge = document.getElementById('badge-ci');
+      ciBadge.innerText = sub.ci_passed ? 'PASS' : 'FAIL';
+      ciBadge.className = `text-xs font-mono px-2 py-0.5 rounded ${sub.ci_passed ? 'bg-emerald-900/60 text-emerald-300' : 'bg-red-900/60 text-red-300'}`;
+
+      const maintBadge = document.getElementById('badge-maintainer');
+      maintBadge.innerText = sub.maintainer_approved ? 'APPROVED' : 'PENDING';
+      maintBadge.className = `text-xs font-mono px-2 py-0.5 rounded ${sub.maintainer_approved ? 'bg-emerald-900/60 text-emerald-300' : 'bg-amber-900/60 text-amber-300'}`;
+
+      document.getElementById('btn-payout').disabled = true;
+    }
+
+    async function runVerificationSuite(id) {
+      const res = await fetch(`/submissions/${id}/run-tests`, { method: 'POST' });
+      const data = await res.json();
+      alert(`Verification Suite Result:\nAll Passed: ${data.all_passed}\nPassed: ${data.passed_tests}/${data.total_tests}\nLogs: ${data.logs}`);
+      await selectSubmission(id);
+      loadAuditEvents();
+    }
+
+    async function runAIReview(id) {
+      const res = await fetch(`/submissions/${id}/ai-review`, { method: 'POST' });
+      const data = await res.json();
+      const badgeAi = document.getElementById('badge-ai');
+      badgeAi.innerText = data.verdict.toUpperCase();
+      badgeAi.className = `text-xs font-mono px-2 py-0.5 rounded ${data.verdict === 'approved' ? 'bg-emerald-900/60 text-emerald-300' : 'bg-red-900/60 text-red-300'}`;
+      alert(`Gemini AI Review Result:\nVerdict: ${data.verdict}\nScore: ${data.score}\nSummary: ${data.summary}`);
+      loadAuditEvents();
+    }
+
+    async function approveMaintainer(id) {
+      const token = prompt('Enter X-MAINTAINER-TOKEN:', 'bountyguard-maintainer-secret');
+      if (!token) return;
+      const res = await fetch(`/submissions/${id}/maintainer-approval`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-MAINTAINER-TOKEN': token
+        },
+        body: JSON.stringify({ approved: true, notes: 'Approved via BountyGuard Mission Control' })
+      });
+      if (!res.ok) {
+        alert('Authentication failed: Invalid Maintainer Token');
+        return;
+      }
+      alert('Maintainer approval signed off successfully!');
+      await selectSubmission(id);
+      loadAuditEvents();
+    }
+
+    async function evaluateActivePolicy() {
+      if (!activeSubmissionId) { alert('Select a submission first.'); return; }
+      const res = await fetch('/policy/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ submission_id: activeSubmissionId })
+      });
+      const data = await res.json();
+      if (data.allowed) {
+        alert('Policy evaluation: ALLOWED! Guardrails satisfied.');
+        document.getElementById('btn-payout').disabled = false;
+      } else {
+        alert(`Policy evaluation: DENIED!\nReasons:\n- ${data.reasons.join('\n- ')}`);
+        document.getElementById('btn-payout').disabled = true;
+      }
+      loadAuditEvents();
+    }
+
+    async function executePayout() {
+      if (!activeSubmissionId) return;
+      const res = await fetch('/payout/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ submission_id: activeSubmissionId })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        alert(`Payout Initiated! Status: ${data.status}\nBatch ID: ${data.sender_batch_id}\nSyncing with PayPal Sandbox...`);
+        const syncRes = await fetch(`/payout/${data.id}/sync`, { method: 'POST' });
+        const syncData = await syncRes.json();
+        alert(`Sync Complete!\nStatus: ${syncData.status}\nBounty Status: ${syncData.bounty_status}`);
+      } else {
+        alert(`Payout Failed: ${JSON.stringify(data.detail)}`);
+      }
+      loadBounties();
+      loadSubmissions();
+      loadAuditEvents();
+    }
+
+    async function loadAuditEvents() {
+      const res = await fetch('/audit-events');
+      const events = await res.json();
+      const container = document.getElementById('audit-timeline');
+      container.innerHTML = events.slice(0, 20).map(e => `
+        <div class="p-2.5 bg-gray-950 rounded-lg border border-gray-800/80 text-xs font-mono space-y-1">
+          <div class="flex justify-between items-center">
+            <span class="text-indigo-400 font-bold">${e.event_type}</span>
+            <span class="text-gray-500 text-[10px]">${new Date(e.created_at).toLocaleTimeString()}</span>
+          </div>
+          <p class="text-gray-400 text-[11px] line-clamp-2">${e.details}</p>
+        </div>
+      `).join('') || '<p class="text-xs text-gray-500">No events logged yet.</p>';
+    }
+
+    async function triggerSeed() {
+      const res = await fetch('/seed', { method: 'POST' });
+      const data = await res.json();
+      alert('Seeded 3 Scenarios:\n1. Good Submission (RateLimiter)\n2. Broken Submission (StreamParser)\n3. Malicious Submission (WebhookDispatcher)');
+      loadBounties();
+      loadSubmissions();
+      loadAuditEvents();
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    loadBounties();
+    loadSubmissions();
+    loadAuditEvents();
+  </script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content)

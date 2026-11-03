@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
 import json
+import logging
 import os
+import re
 from typing import Any, List, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse
@@ -27,7 +29,7 @@ from app.models import (
 )
 from app.seed import seed_demo_scenarios
 from app.services.ai_reviewer import AIReviewer
-from app.services.paypal import PayPalPayoutError, PayPalService
+from app.services.paypal import PayPalPayoutError, PayPalService, PayPalWebhookVerificationError
 from app.services.payout_orchestrator import (
     DuplicatePayoutError,
     PayoutOrchestrator,
@@ -36,7 +38,15 @@ from app.services.payout_orchestrator import (
 from app.services.policy import PolicyEngine
 from app.services.test_runner import FixtureTestRunner, TestExecutionResult
 
-MAINTAINER_TOKEN = os.getenv("MAINTAINER_TOKEN", "bountyguard-maintainer-secret")
+logger = logging.getLogger(__name__)
+
+# Strict regex matching GitHub PR URLs to prevent SSRF
+GITHUB_PR_REGEX = re.compile(
+    r"^https://github\.com/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+)/pull/([0-9]+)/?$"
+)
+
+# Maintainer token from environment (Fail closed: No insecure defaults!)
+MAINTAINER_TOKEN = os.getenv("MAINTAINER_TOKEN")
 
 
 @asynccontextmanager
@@ -79,7 +89,7 @@ def health_check():
 
 @app.post("/bounties", response_model=BountyRead, status_code=status.HTTP_201_CREATED)
 def create_bounty(bounty_in: BountyCreate, db: Session = Depends(get_db)):
-    """Creates a bounty. Maintainers can define test_suite_spec or acceptance_criteria."""
+    """Creates a bounty. Maintainers can define acceptance criteria (required symbols, forbidden symbols, min score)."""
     bounty = BountyModel(
         title=bounty_in.title,
         description=bounty_in.description,
@@ -110,7 +120,7 @@ def get_bounty(bounty_id: int, db: Session = Depends(get_db)):
 
 @app.post("/submissions", response_model=SubmissionRead, status_code=status.HTTP_201_CREATED)
 async def create_submission(sub_in: SubmissionCreate, db: Session = Depends(get_db)):
-    """Creates a submission. Freezes immutable code diff from PR or pre-seeded verified fixture."""
+    """Creates a submission. Validates PR URL to prevent SSRF and freezes the immutable code diff."""
     bounty = db.query(BountyModel).filter(BountyModel.id == sub_in.bounty_id).first()
     if not bounty:
         raise HTTPException(status_code=404, detail="Bounty not found")
@@ -118,23 +128,31 @@ async def create_submission(sub_in: SubmissionCreate, db: Session = Depends(get_
     code_diff = sub_in.code_diff
     diff_source = "preseeded_fixture"
 
-    # If code_diff was not provided explicitly, attempt to fetch live PR diff from pr_url
-    if not code_diff and sub_in.pr_url:
+    # Validate pr_url format strictly to prevent SSRF attacks
+    pr_match = GITHUB_PR_REGEX.match(sub_in.pr_url.strip())
+    if not pr_match:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid pr_url. Must be a GitHub pull request URL (https://github.com/<owner>/<repo>/pull/<number>).",
+        )
+
+    # If code_diff was not supplied, fetch diff safely from verified GitHub host
+    if not code_diff and pr_match:
+        owner, repo, pr_number = pr_match.groups()
+        diff_url = f"https://patch-diff.githubusercontent.com/raw/{owner}/{repo}/pull/{pr_number}.diff"
         try:
-            # Support GitHub PR URLs e.g. https://github.com/owner/repo/pull/123
-            diff_url = sub_in.pr_url.rstrip("/") + ".diff"
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(diff_url, headers={"User-Agent": "BountyGuard-Agent"})
                 if resp.status_code == 200 and resp.text.strip():
                     code_diff = resp.text
                     diff_source = "github_pr_diff"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error fetching GitHub PR diff: {e}")
 
     if not code_diff or not code_diff.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Could not retrieve code diff from pr_url. Please provide code_diff directly (or use a demo fixture).",
+            detail="Could not retrieve code diff from GitHub. Please provide code_diff explicitly (or use demo fixture).",
         )
 
     submission = SubmissionModel(
@@ -176,10 +194,13 @@ def set_maintainer_approval(
     x_maintainer_token: Optional[str] = Header(None, alias="X-MAINTAINER-TOKEN"),
     db: Session = Depends(get_db),
 ):
-    """Protected maintainer sign-off endpoint. Enforces maintainer token authentication
-    and records an immutable audit event for maintainer approval decisions.
-    """
-    # Enforce maintainer token check
+    """Protected maintainer sign-off endpoint. Fails closed if MAINTAINER_TOKEN is unset."""
+    if not MAINTAINER_TOKEN or not MAINTAINER_TOKEN.strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Maintainer authentication is not configured on this server (MAINTAINER_TOKEN unset).",
+        )
+
     if not x_maintainer_token or x_maintainer_token != MAINTAINER_TOKEN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -218,7 +239,7 @@ def run_submission_tests(
     db: Session = Depends(get_db),
 ):
     """Executes server-side verification suite (diff integrity, AST syntax parsing,
-    static security guardrails, and maintainer's acceptance criteria).
+    static security guardrails, required symbols, and forbidden symbols).
     Does NOT accept arbitrary untrusted code execution from caller.
     """
     try:
@@ -256,7 +277,7 @@ def evaluate_policy(
     db: Session = Depends(get_db),
 ):
     """Accepts ONLY submission_id. All policy parameters (amount, recipient email,
-    CI results, AI review, maintainer approval, and duplicate payout checks)
+    CI results, AI review, min_score, maintainer approval, and duplicate payout checks)
     are loaded directly from the database server-side.
     """
     result = policy_engine.evaluate_submission(db=db, submission_id=request.submission_id)
@@ -327,20 +348,29 @@ async def sync_payout(
 
 @app.post("/webhooks/paypal")
 async def paypal_webhook(request: Request, db: Session = Depends(get_db)):
-    """Receives and cryptographically verifies asynchronous PayPal webhooks
-    before syncing payout status.
+    """Receives and cryptographically verifies asynchronous PayPal webhooks.
+    Fails closed: Rejects requests if PAYPAL_WEBHOOK_ID is unconfigured or signature is invalid.
     """
     payload = await request.json()
     headers = dict(request.headers)
 
-    # Cryptographically verify webhook signature when PAYPAL_WEBHOOK_ID is configured
-    if paypal_service.webhook_id:
+    # Fail closed: Reject if PAYPAL_WEBHOOK_ID is unconfigured
+    if not paypal_service.webhook_id or not paypal_service.webhook_id.strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PAYPAL_WEBHOOK_ID is not configured on this server; unverified webhooks rejected.",
+        )
+
+    try:
         verified = await paypal_service.verify_webhook_signature(headers=headers, body_json=payload)
-        if not verified:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid PayPal webhook signature",
-            )
+    except PayPalWebhookVerificationError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+
+    if not verified:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid PayPal webhook signature.",
+        )
 
     event_type = payload.get("event_type", "")
     resource = payload.get("resource", {})
@@ -376,16 +406,16 @@ def get_audit_events(
 
 @app.post("/seed")
 def seed_demo(db: Session = Depends(get_db)):
-    """Seeds the three end-to-end scenarios for hackathon demonstration."""
+    """Seeds the three demo scenarios without pre-approvals so the full live flow can be demonstrated."""
     summary = seed_demo_scenarios(db)
     return {"status": "seeded", "scenarios": summary}
 
 
-# --- Interactive UI Dashboard ---
+# --- Interactive Mission Control Dashboard ---
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard():
-    """Renders the BountyGuard Mission Control dashboard."""
+    """Renders the secure BountyGuard Mission Control dashboard."""
     html_content = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -464,7 +494,7 @@ def get_dashboard():
 
         <div id="inspector-panel" class="space-y-4">
           <div class="bg-gray-950 rounded-xl p-3 border border-gray-800/80 text-xs text-gray-400">
-            Select a submission from the left to inspect its frozen code diff, automated verification suite, and AI review.
+            Select a submission from the left to inspect its frozen code diff, run the verification suite, trigger Gemini AI review, and maintainer sign-off.
           </div>
         </div>
       </div>
@@ -476,7 +506,7 @@ def get_dashboard():
         </h2>
         <div id="policy-checklist" class="space-y-2.5 text-sm">
           <div class="flex items-center justify-between p-2.5 bg-gray-950/60 rounded-lg border border-gray-800/60">
-            <span class="text-gray-300 flex items-center gap-2"><i class="fa-solid fa-vial text-gray-500"></i> Verification Suite (AST & Syntax)</span>
+            <span class="text-gray-300 flex items-center gap-2"><i class="fa-solid fa-vial text-gray-500"></i> Verification Suite (AST, Syntax & Symbols)</span>
             <span id="badge-ci" class="text-xs font-mono px-2 py-0.5 rounded bg-gray-800 text-gray-400">Pending</span>
           </div>
           <div class="flex items-center justify-between p-2.5 bg-gray-950/60 rounded-lg border border-gray-800/60">
@@ -526,6 +556,16 @@ def get_dashboard():
     let activeSubmissionId = null;
     let activeBountyId = null;
 
+    function escapeHtml(text) {
+      if (text === null || text === undefined) return '';
+      return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
     async function loadBounties() {
       const res = await fetch('/bounties');
       const bounties = await res.json();
@@ -534,15 +574,15 @@ def get_dashboard():
       container.innerHTML = bounties.map(b => `
         <div class="p-3 bg-gray-950 hover:bg-gray-800/80 rounded-xl border border-gray-800 cursor-pointer transition" onclick="selectBounty(${b.id})">
           <div class="flex justify-between items-start">
-            <h3 class="text-sm font-semibold text-gray-200 line-clamp-1">${b.title}</h3>
-            <span class="text-xs font-mono text-emerald-400 font-bold">$${b.amount}</span>
+            <h3 class="text-sm font-semibold text-gray-200 line-clamp-1">${escapeHtml(b.title)}</h3>
+            <span class="text-xs font-mono text-emerald-400 font-bold">$${escapeHtml(b.amount)}</span>
           </div>
           <div class="flex justify-between items-center mt-2 text-xs text-gray-500">
-            <span>#${b.id}</span>
+            <span>#${escapeHtml(b.id)}</span>
             <span class="px-2 py-0.5 rounded text-[10px] uppercase font-bold ${
               b.status === 'paid' ? 'bg-emerald-900/50 text-emerald-400' :
               b.status === 'pending_payout' ? 'bg-amber-900/50 text-amber-400' : 'bg-gray-800 text-gray-400'
-            }">${b.status}</span>
+            }">${escapeHtml(b.status)}</span>
           </div>
         </div>
       `).join('') || '<p class="text-xs text-gray-500">No bounties found. Click Seed.</p>';
@@ -556,8 +596,8 @@ def get_dashboard():
       container.innerHTML = subs.map(s => `
         <div class="p-3 bg-gray-950 hover:bg-gray-800/80 rounded-xl border border-gray-800 cursor-pointer transition ${activeSubmissionId === s.id ? 'ring-2 ring-blue-500' : ''}" onclick="selectSubmission(${s.id})">
           <div class="flex justify-between items-start">
-            <span class="text-xs font-mono text-blue-400 font-semibold">PR #${s.id}</span>
-            <span class="text-xs font-mono text-gray-400 line-clamp-1">${s.contributor_email}</span>
+            <span class="text-xs font-mono text-blue-400 font-semibold">PR #${escapeHtml(s.id)}</span>
+            <span class="text-xs font-mono text-gray-400 line-clamp-1">${escapeHtml(s.contributor_email)}</span>
           </div>
           <div class="flex items-center gap-2 mt-2">
             <span class="text-[10px] px-1.5 py-0.5 rounded ${s.ci_passed ? 'bg-emerald-900/40 text-emerald-300' : 'bg-red-900/40 text-red-300'}">CI: ${s.ci_passed ? 'PASS' : 'FAIL'}</span>
@@ -579,16 +619,16 @@ def get_dashboard():
         <div class="space-y-3">
           <div class="flex justify-between items-center text-xs">
             <span class="text-gray-400">Contributor:</span>
-            <span class="font-mono text-gray-200">${sub.contributor_email}</span>
+            <span class="font-mono text-gray-200">${escapeHtml(sub.contributor_email)}</span>
           </div>
           <div class="flex justify-between items-center text-xs">
             <span class="text-gray-400">Diff Source:</span>
-            <span class="font-mono px-2 py-0.5 rounded bg-gray-800 text-indigo-300">${sub.diff_source}</span>
+            <span class="font-mono px-2 py-0.5 rounded bg-gray-800 text-indigo-300">${escapeHtml(sub.diff_source)}</span>
           </div>
           <div>
             <div class="flex justify-between text-xs text-gray-400 mb-1">
               <span>Frozen Code Diff:</span>
-              <span class="font-mono text-[10px]">SHA: ${sub.commit_sha || 'N/A'}</span>
+              <span class="font-mono text-[10px]">SHA: ${escapeHtml(sub.commit_sha) || 'N/A'}</span>
             </div>
             <pre class="bg-gray-950 p-2.5 rounded-lg border border-gray-800 text-[11px] text-gray-300 max-h-36 overflow-auto font-mono whitespace-pre">${escapeHtml(sub.code_diff)}</pre>
           </div>
@@ -643,7 +683,8 @@ def get_dashboard():
     }
 
     async function approveMaintainer(id) {
-      const token = prompt('Enter X-MAINTAINER-TOKEN:', 'bountyguard-maintainer-secret');
+      // Prompt user with a blank input (Fail closed, no hardcoded defaults)
+      const token = prompt('Enter X-MAINTAINER-TOKEN:');
       if (!token) return;
       const res = await fetch(`/submissions/${id}/maintainer-approval`, {
         method: 'POST',
@@ -654,7 +695,8 @@ def get_dashboard():
         body: JSON.stringify({ approved: true, notes: 'Approved via BountyGuard Mission Control' })
       });
       if (!res.ok) {
-        alert('Authentication failed: Invalid Maintainer Token');
+        const err = await res.json();
+        alert(`Authentication failed: ${err.detail || 'Invalid Maintainer Token'}`);
         return;
       }
       alert('Maintainer approval signed off successfully!');
@@ -705,13 +747,13 @@ def get_dashboard():
       const res = await fetch('/audit-events');
       const events = await res.json();
       const container = document.getElementById('audit-timeline');
-      container.innerHTML = events.slice(0, 20).map(e => `
+      container.innerHTML = events.slice(0, 25).map(e => `
         <div class="p-2.5 bg-gray-950 rounded-lg border border-gray-800/80 text-xs font-mono space-y-1">
           <div class="flex justify-between items-center">
-            <span class="text-indigo-400 font-bold">${e.event_type}</span>
+            <span class="text-indigo-400 font-bold">${escapeHtml(e.event_type)}</span>
             <span class="text-gray-500 text-[10px]">${new Date(e.created_at).toLocaleTimeString()}</span>
           </div>
-          <p class="text-gray-400 text-[11px] line-clamp-2">${e.details}</p>
+          <p class="text-gray-400 text-[11px] line-clamp-2">${escapeHtml(e.details)}</p>
         </div>
       `).join('') || '<p class="text-xs text-gray-500">No events logged yet.</p>';
     }
@@ -719,15 +761,10 @@ def get_dashboard():
     async function triggerSeed() {
       const res = await fetch('/seed', { method: 'POST' });
       const data = await res.json();
-      alert('Seeded 3 Scenarios:\n1. Good Submission (RateLimiter)\n2. Broken Submission (StreamParser)\n3. Malicious Submission (WebhookDispatcher)');
+      alert('Seeded 3 Scenarios (bounties & raw submissions only, without pre-approvals):\n1. Good Submission (RateLimiter)\n2. Broken Submission (StreamParser)\n3. Malicious Submission (WebhookDispatcher)\n\nClick the verification and AI review buttons to run the live workflow!');
       loadBounties();
       loadSubmissions();
       loadAuditEvents();
-    }
-
-    function escapeHtml(text) {
-      if (!text) return '';
-      return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
     loadBounties();

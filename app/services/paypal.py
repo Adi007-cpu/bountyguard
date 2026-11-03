@@ -171,11 +171,14 @@ class PayPalService:
         headers: dict[str, str],
         body_json: dict[str, Any],
     ) -> bool:
-        """Verifies incoming PayPal webhook signature via PayPal's verify-webhook-signature API."""
-        if not self.webhook_id:
-            # If webhook ID is unconfigured in development/test, reject or warn
-            logger.warning("PAYPAL_WEBHOOK_ID is not configured. Webhook signature cannot be verified.")
-            return False
+        """Verifies incoming PayPal webhook signature via PayPal's verify-webhook-signature API.
+        Fails closed if PAYPAL_WEBHOOK_ID is unconfigured.
+        """
+        if not self.webhook_id or not self.webhook_id.strip():
+            logger.error("PAYPAL_WEBHOOK_ID is not configured. Rejecting webhook (fail closed).")
+            raise PayPalWebhookVerificationError(
+                "PAYPAL_WEBHOOK_ID is not configured on this server. Webhook verification rejected."
+            )
 
         token = await self.get_access_token()
 

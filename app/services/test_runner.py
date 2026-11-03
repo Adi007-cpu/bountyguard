@@ -27,9 +27,10 @@ class TestExecutionResult(BaseModel):
 
 
 class FixtureTestRunner:
-    """Server-side automated test execution layer.
+    """Server-side automated verification suite.
     
     Loads stored code diff and maintainer's bounty test suite specification from the database.
+    Evaluates diff integrity, AST syntax validation, security guardrails, and maintainer criteria.
     Does NOT accept caller-supplied test outcomes or verification contexts.
     """
 
@@ -91,18 +92,30 @@ class FixtureTestRunner:
         if sec_clean:
             passed_count += 1
 
-        # Test 4: Maintainer's Bounty Acceptance Test Spec Conformance
+        # Test 4: Maintainer's Bounty Acceptance Criteria (Required & Forbidden Symbols)
         spec_passed = True
-        spec_msg = "Conforms to maintainer's bounty acceptance test specification"
+        spec_msg = "Conforms to maintainer's acceptance criteria"
         if maintainer_spec_json:
             try:
                 spec_data = json.loads(maintainer_spec_json)
                 required_symbols = spec_data.get("required_symbols", [])
+                forbidden_symbols = spec_data.get("forbidden_symbols", [])
+
+                # Verify required symbols
                 for sym in required_symbols:
                     if sym not in code_diff:
                         spec_passed = False
-                        spec_msg = f"Missing required function or symbol '{sym}' from bounty specification"
+                        spec_msg = f"Missing required symbol '{sym}' from maintainer specification"
                         break
+
+                # Verify forbidden symbols
+                if spec_passed:
+                    for sym in forbidden_symbols:
+                        if sym in code_diff:
+                            spec_passed = False
+                            spec_msg = f"Detected forbidden symbol '{sym}' disallowed by maintainer specification"
+                            break
+
             except Exception as e:
                 logger.warning(f"Error parsing bounty maintainer test_suite_spec: {e}")
 
@@ -112,7 +125,7 @@ class FixtureTestRunner:
 
         total_tests = len(results)
         all_passed = passed_count == total_tests
-        logs = f"Automated test run finished: {passed_count}/{total_tests} test suites passed."
+        logs = f"Verification suite finished: {passed_count}/{total_tests} checks passed."
         return all_passed, results, logs
 
     def execute_and_update_submission(
@@ -120,7 +133,7 @@ class FixtureTestRunner:
         db: Session,
         submission_id: int,
     ) -> TestExecutionResult:
-        """Loads stored submission and maintainer's bounty from DB, runs test suite, and updates DB status."""
+        """Loads stored submission and maintainer's bounty from DB, runs verification suite, and updates DB status."""
         submission = db.query(SubmissionModel).filter(SubmissionModel.id == submission_id).first()
         if not submission:
             raise ValueError(f"Submission {submission_id} not found.")

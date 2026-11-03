@@ -27,7 +27,8 @@ from app.services.policy import PolicyEngine
 
 
 @pytest.fixture
-def test_env():
+def test_env(monkeypatch):
+    monkeypatch.setattr("app.main.MAINTAINER_TOKEN", "scenario-maintainer-secret")
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -115,7 +116,7 @@ def test_scenario_1_good_submission_end_to_end(test_env):
     # 5. Maintainer approves via authenticated token endpoint
     approval_resp = client.post(
         f"/submissions/{sub_id}/maintainer-approval",
-        headers={"X-MAINTAINER-TOKEN": "bountyguard-maintainer-secret"},
+        headers={"X-MAINTAINER-TOKEN": "scenario-maintainer-secret"},
         json={"approved": True, "notes": "LGTM, verified in staging environment."},
     )
     assert approval_resp.status_code == 200

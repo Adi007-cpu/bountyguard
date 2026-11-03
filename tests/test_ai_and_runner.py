@@ -10,7 +10,9 @@ from app.models import (
     AIReviewAssessment,
     BountyModel,
     BountyStatus,
+    ReviewModel,
     ReviewVerdict,
+    ReviewerType,
     SubmissionModel,
     SubmissionStatus,
 )
@@ -203,3 +205,68 @@ def compute_checksum(data): return "hash123"
     res2 = runner.execute_and_update_submission(db, sub_complete.id)
     assert res2.all_passed is True
     assert sub_complete.ci_passed is True
+
+
+def test_enforcement_of_forbidden_symbols_and_min_score(db):
+    """P1 verification: Enforce forbidden_symbols in runner and min_score in policy."""
+    from app.services.policy import PolicyEngine
+
+    bounty_spec = json.dumps({
+        "required_symbols": ["safe_compute"],
+        "forbidden_symbols": ["dangerous_sink"],
+        "min_score": 0.90,
+    })
+    bounty = BountyModel(
+        title="Enforce forbidden symbol check",
+        description="Verify forbidden symbol rejection",
+        amount=Decimal("100.00"),
+        currency="USD",
+        status=BountyStatus.OPEN.value,
+        test_suite_spec=bounty_spec,
+    )
+    db.add(bounty)
+    db.commit()
+
+    # Case 1: Diff contains forbidden_symbol -> runner fails
+    sub_forbidden = SubmissionModel(
+        bounty_id=bounty.id,
+        contributor_email="dev@example.com",
+        pr_url="https://github.com/example/repo/pull/1",
+        code_diff="def safe_compute(): dangerous_sink()",
+        status=SubmissionStatus.PENDING.value,
+    )
+    db.add(sub_forbidden)
+    db.commit()
+
+    runner = FixtureTestRunner()
+    res = runner.execute_and_update_submission(db, sub_forbidden.id)
+    assert res.all_passed is False
+    assert any("Detected forbidden symbol 'dangerous_sink'" in r.message for r in res.test_results)
+
+    # Case 2: Clean code, but AI review score is 0.75 (< min_score 0.90) -> policy denies
+    sub_low_score = SubmissionModel(
+        bounty_id=bounty.id,
+        contributor_email="dev2@example.com",
+        pr_url="https://github.com/example/repo/pull/2",
+        code_diff="def safe_compute(): return 42",
+        status=SubmissionStatus.PENDING.value,
+        ci_passed=True,
+        maintainer_approved=True,
+    )
+    db.add(sub_low_score)
+    db.commit()
+
+    rev_low = ReviewModel(
+        submission_id=sub_low_score.id,
+        reviewer_type=ReviewerType.AI.value,
+        verdict=ReviewVerdict.APPROVED.value,
+        score=Decimal("0.75"),  # Below required 0.90 threshold
+        summary="Acceptable but low score",
+    )
+    db.add(rev_low)
+    db.commit()
+
+    policy = PolicyEngine()
+    policy_res = policy.evaluate_submission(db, sub_low_score.id)
+    assert policy_res.allowed is False
+    assert any("does not meet maintainer's minimum threshold" in r for r in policy_res.reasons)

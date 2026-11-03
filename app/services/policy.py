@@ -1,5 +1,6 @@
 import json
 from decimal import Decimal
+import logging
 from typing import Optional
 from sqlalchemy.orm import Session
 
@@ -16,11 +17,13 @@ from app.models import (
     SubmissionModel,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class PolicyEngine:
     """Server-side policy validation engine.
     
-    Evaluates trusted database records (bounty, submission, CI execution, AI reviews,
+    Evaluates trusted database records (bounty, submission, CI verification, AI reviews,
     maintainer approvals, duplicate payout constraints, and ceiling limits).
     Client inputs cannot influence approval rules.
     """
@@ -84,11 +87,11 @@ class PolicyEngine:
         if not submission.maintainer_approved:
             reasons.append("Maintainer approval has not been granted for this submission.")
 
-        # 4. CI automated test pass check
+        # 4. CI automated verification pass check
         if not submission.ci_passed:
-            reasons.append("CI automated tests have not passed for this submission.")
+            reasons.append("CI automated tests have not passed (verification suite failed for this submission).")
 
-        # 5. AI review verification
+        # 5. AI review verification & min_score enforcement
         ai_review = (
             db.query(ReviewModel)
             .filter(
@@ -104,6 +107,20 @@ class PolicyEngine:
             reasons.append(
                 f"AI review verdict is '{ai_review.verdict}': {ai_review.summary}"
             )
+        else:
+            # Check maintainer min_score requirement if defined
+            if bounty.test_suite_spec:
+                try:
+                    spec_data = json.loads(bounty.test_suite_spec)
+                    min_score = spec_data.get("min_score")
+                    if min_score is not None:
+                        min_score_dec = Decimal(str(min_score))
+                        if ai_review.score is not None and ai_review.score < min_score_dec:
+                            reasons.append(
+                                f"AI review quality score ({ai_review.score:.2f}) does not meet maintainer's minimum threshold of {min_score_dec:.2f}."
+                            )
+                except Exception as e:
+                    logger.warning(f"Error parsing bounty test_suite_spec for min_score check: {e}")
 
         # 6. Recipient email validation
         if not submission.contributor_email or "@" not in submission.contributor_email:

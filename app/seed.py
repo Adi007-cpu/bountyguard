@@ -6,19 +6,11 @@ from sqlalchemy.orm import Session
 
 from app.database import Base, SessionLocal, engine, init_db
 from app.models import (
-    AuditEventModel,
     BountyModel,
     BountyStatus,
-    PayoutModel,
-    PayoutStatus,
-    ReviewModel,
-    ReviewVerdict,
-    ReviewerType,
     SubmissionModel,
     SubmissionStatus,
 )
-from app.services.ai_reviewer import AIReviewer
-from app.services.test_runner import FixtureTestRunner
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +39,7 @@ class RateLimiter:
 BROKEN_DIFF = """
 class StreamParser:
     def stream_parse(self, chunk: bytes):
-        # Broken syntax: missing closing parenthesis and unhandled exception
+        # Broken syntax: missing closing parenthesis and syntax error
         if len(chunk == 0:
             return None
 """.strip()
@@ -63,17 +55,24 @@ class WebhookDispatcher:
 
 
 def seed_demo_scenarios(db: Session) -> dict[str, Any]:
-    """Seeds the three canonical end-to-end scenarios for BountyGuard demonstration."""
+    """Seeds ONLY bounties and raw submissions without pre-approvals.
+    Requires running the live verification suite, Gemini AI review, and maintainer approval
+    interactively through the dashboard or API to demonstrate the real guarded workflow.
+    """
     init_db()
 
-    # --- Scenario 1: Good Submission (Approved -> Paid) ---
+    # --- Scenario 1: Good Submission (Candidate for Approval & Payout) ---
     bounty_good = BountyModel(
         title="Implement sliding window RateLimiter middleware",
         description="Provide a production-ready RateLimiter class with sliding window check_rate_limit method.",
         amount=Decimal("350.00"),
         currency="USD",
         status=BountyStatus.OPEN.value,
-        test_suite_spec=json.dumps({"required_symbols": ["RateLimiter", "check_rate_limit"]}),
+        test_suite_spec=json.dumps({
+            "required_symbols": ["RateLimiter", "check_rate_limit"],
+            "forbidden_symbols": ["eval", "os.system"],
+            "min_score": 0.85,
+        }),
     )
     db.add(bounty_good)
     db.commit()
@@ -87,40 +86,25 @@ def seed_demo_scenarios(db: Session) -> dict[str, Any]:
         commit_sha="a1b2c3d4e5f67890",
         diff_source="preseeded_fixture",
         status=SubmissionStatus.PENDING.value,
-        ci_passed=True,
-        maintainer_approved=True,
+        ci_passed=False,
+        maintainer_approved=False,
     )
     db.add(sub_good)
     db.commit()
     db.refresh(sub_good)
 
-    rev_good = ReviewModel(
-        submission_id=sub_good.id,
-        reviewer_type=ReviewerType.AI.value,
-        verdict=ReviewVerdict.APPROVED.value,
-        score=Decimal("0.96"),
-        summary="Gemini 3.8 Flash Code Review: Clean sliding-window rate limiter implementation matching all specification requirements.",
-        details=json.dumps({"spec_met": True, "security_clean": True}),
-    )
-    db.add(rev_good)
-
-    audit_good = AuditEventModel(
-        event_type="MAINTAINER_APPROVAL",
-        bounty_id=bounty_good.id,
-        submission_id=sub_good.id,
-        details=json.dumps({"maintainer": "alice@project-core.org", "notes": "LGTM. Verified in staging."}),
-    )
-    db.add(audit_good)
-    db.commit()
-
-    # --- Scenario 2: Broken Submission (Verification Fails -> Payout Blocked) ---
+    # --- Scenario 2: Broken Submission (Candidate for Verification Failure) ---
     bounty_broken = BountyModel(
         title="StreamParser buffer management",
         description="Implement stream_parse and cleanup_buffer functions for streaming chunk parsing.",
         amount=Decimal("200.00"),
         currency="USD",
         status=BountyStatus.OPEN.value,
-        test_suite_spec=json.dumps({"required_symbols": ["stream_parse", "cleanup_buffer"]}),
+        test_suite_spec=json.dumps({
+            "required_symbols": ["stream_parse", "cleanup_buffer"],
+            "forbidden_symbols": [],
+            "min_score": 0.80,
+        }),
     )
     db.add(bounty_broken)
     db.commit()
@@ -133,7 +117,7 @@ def seed_demo_scenarios(db: Session) -> dict[str, Any]:
         code_diff=BROKEN_DIFF,
         commit_sha="b2c3d4e5f6a7b8c9",
         diff_source="preseeded_fixture",
-        status=SubmissionStatus.REJECTED.value,
+        status=SubmissionStatus.PENDING.value,
         ci_passed=False,
         maintainer_approved=False,
     )
@@ -141,18 +125,18 @@ def seed_demo_scenarios(db: Session) -> dict[str, Any]:
     db.commit()
     db.refresh(sub_broken)
 
-    # Run verification suite to record actual failure
-    test_runner = FixtureTestRunner()
-    test_res_broken = test_runner.execute_and_update_submission(db, sub_broken.id)
-
-    # --- Scenario 3: Malicious Submission (Static Scan & AI Reject -> Payout Blocked) ---
+    # --- Scenario 3: Malicious Submission (Candidate for Static/AI Rejection) ---
     bounty_malicious = BountyModel(
         title="Webhook dispatch utility",
-        description="Implement dispatch method to send JSON payloads to target webhooks.",
+        description="Implement dispatch method to send JSON payloads to target webhooks securely.",
         amount=Decimal("500.00"),
         currency="USD",
         status=BountyStatus.OPEN.value,
-        test_suite_spec=json.dumps({"required_symbols": ["WebhookDispatcher", "dispatch"]}),
+        test_suite_spec=json.dumps({
+            "required_symbols": ["WebhookDispatcher", "dispatch"],
+            "forbidden_symbols": ["os.system", "subprocess"],
+            "min_score": 0.90,
+        }),
     )
     db.add(bounty_malicious)
     db.commit()
@@ -165,7 +149,7 @@ def seed_demo_scenarios(db: Session) -> dict[str, Any]:
         code_diff=MALICIOUS_DIFF,
         commit_sha="deadbeef12345678",
         diff_source="preseeded_fixture",
-        status=SubmissionStatus.REJECTED.value,
+        status=SubmissionStatus.PENDING.value,
         ci_passed=False,
         maintainer_approved=False,
     )
@@ -173,27 +157,21 @@ def seed_demo_scenarios(db: Session) -> dict[str, Any]:
     db.commit()
     db.refresh(sub_malicious)
 
-    # AI reviewer records rejection from static security pre-check
-    ai_reviewer = AIReviewer()
-    rev_malicious = ai_reviewer.evaluate_and_record_submission(db, sub_malicious.id)
-
     return {
         "scenario_1_good": {
             "bounty_id": bounty_good.id,
             "submission_id": sub_good.id,
-            "status": "ready_for_payout",
+            "instruction": "Click 'Run Verification Suite' -> 'Run Gemini AI Review' -> 'Maintainer Sign-Off' -> 'Execute Payout'",
         },
         "scenario_2_broken": {
             "bounty_id": bounty_broken.id,
             "submission_id": sub_broken.id,
-            "status": "verification_failed",
-            "ci_passed": sub_broken.ci_passed,
+            "instruction": "Click 'Run Verification Suite' to observe AST syntax error blocking payout",
         },
         "scenario_3_malicious": {
             "bounty_id": bounty_malicious.id,
             "submission_id": sub_malicious.id,
-            "status": "security_rejected",
-            "verdict": rev_malicious.verdict,
+            "instruction": "Click 'Run Gemini AI Review' to observe static security pre-check blocking payout",
         },
     }
 

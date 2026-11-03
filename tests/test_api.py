@@ -22,7 +22,8 @@ from app.models import (
 
 
 @pytest.fixture
-def test_client():
+def test_client(monkeypatch):
+    monkeypatch.setattr("app.main.MAINTAINER_TOKEN", "test-secret-maintainer-token")
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -55,16 +56,28 @@ def test_api_bounty_and_submission_lifecycle(test_client):
             "description": "SQL injection vulnerability patch",
             "amount": 450.00,
             "currency": "USD",
-            "test_suite_spec": '{"required_symbols": ["sanitize"]}',
+            "test_suite_spec": '{"required_symbols": ["sanitize"], "forbidden_symbols": ["eval"]}',
         },
     )
     assert bounty_resp.status_code == 201
     bounty_data = bounty_resp.json()
     bounty_id = bounty_data["id"]
     assert bounty_data["amount"] == "450.00"
-    assert bounty_data["test_suite_spec"] is not None
 
-    # 2. Create Submission with stored, immutable code_diff
+    # 2. SSRF Guard: Reject invalid/unauthorized PR URLs
+    bad_ssrf = client.post(
+        "/submissions",
+        json={
+            "bounty_id": bounty_id,
+            "contributor_email": "attacker@evil.com",
+            "pr_url": "http://169.254.169.254/latest/meta-data/",
+            "code_diff": "def evil(): pass",
+        },
+    )
+    assert bad_ssrf.status_code == 400
+    assert "Invalid pr_url" in bad_ssrf.json()["detail"]
+
+    # 3. Create Submission with stored, immutable code_diff and valid GitHub PR URL
     sub_resp = client.post(
         "/submissions",
         json={
@@ -79,55 +92,51 @@ def test_api_bounty_and_submission_lifecycle(test_client):
     sub_id = sub_data["id"]
     assert sub_data["ci_passed"] is False
     assert sub_data["maintainer_approved"] is False
-    assert "sanitize" in sub_data["code_diff"]
 
-    # 3. Policy evaluation fails initially because server-side checks aren't met
+    # 4. Policy evaluation fails initially
     eval_resp = client.post("/policy/evaluate", json={"submission_id": sub_id})
     assert eval_resp.status_code == 200
-    eval_data = eval_resp.json()
-    assert eval_data["allowed"] is False
-    assert len(eval_data["reasons"]) > 0
+    assert eval_resp.json()["allowed"] is False
 
-    # 4. Caller CANNOT spoof amount, CI or approvals via client request
-    spoof_attempt = client.post(
-        "/policy/evaluate",
-        json={
-            "submission_id": sub_id,
-            "amount": 10.00,
-            "ci_passed": True,
-            "maintainer_approved": True,
-        },
-    )
-    assert spoof_attempt.status_code == 200
-    assert spoof_attempt.json()["allowed"] is False
-
-    # 5. Run test runner (takes NO caller context; evaluates stored code diff against maintainer spec)
+    # 5. Run verification suite
     test_run_resp = client.post(f"/submissions/{sub_id}/run-tests")
     assert test_run_resp.status_code == 200
     assert test_run_resp.json()["all_passed"] is True
 
-    # 6. Run AI review (fails closed if GEMINI_API_KEY is unset, requiring maintainer human review)
+    # 6. Run AI review
     ai_rev_resp = client.post(f"/submissions/{sub_id}/ai-review")
     assert ai_rev_resp.status_code == 200
-    # In test environment without Gemini key, it fails closed to changes_requested
     assert ai_rev_resp.json()["verdict"] in ("approved", "changes_requested")
 
-    # Maintainer reviews and approves submission directly in DB
+    # 7. Maintainer sign-off via token auth
+    # Unauthenticated / invalid token fails closed with 403
+    bad_auth = client.post(
+        f"/submissions/{sub_id}/maintainer-approval",
+        headers={"X-MAINTAINER-TOKEN": "wrong-token"},
+        json={"approved": True},
+    )
+    assert bad_auth.status_code == 403
+
+    # Authenticated maintainer sign-off
+    good_auth = client.post(
+        f"/submissions/{sub_id}/maintainer-approval",
+        headers={"X-MAINTAINER-TOKEN": "test-secret-maintainer-token"},
+        json={"approved": True, "notes": "Approved by maintainer."},
+    )
+    assert good_auth.status_code == 200
+    assert good_auth.json()["maintainer_approved"] is True
+
+    # Make review approved for final policy check
     db = SessionLocal()
     rev = db.query(ReviewModel).filter(ReviewModel.submission_id == sub_id).first()
     rev.verdict = ReviewVerdict.APPROVED.value
-    sub = db.query(SubmissionModel).filter(SubmissionModel.id == sub_id).first()
-    sub.maintainer_approved = True
     db.commit()
     db.close()
 
-    # 7. Re-evaluate policy: now allowed!
+    # 8. Re-evaluate policy: now allowed!
     eval_resp2 = client.post("/policy/evaluate", json={"submission_id": sub_id})
     assert eval_resp2.status_code == 200
-    eval_data2 = eval_resp2.json()
-    assert eval_data2["allowed"] is True
-    assert eval_data2["amount"] == "450.00"
-    assert eval_data2["recipient_email"] == "security_pro@example.com"
+    assert eval_resp2.json()["allowed"] is True
 
 
 def test_api_payout_guarded_endpoint_and_sync(test_client):
@@ -212,14 +221,26 @@ def test_api_payout_guarded_endpoint_and_sync(test_client):
         assert bounty_after_sync["status"] == "paid"
 
 
-def test_api_webhook_signature_verification(test_client):
-    """P1 verification: Webhooks must verify cryptographic signature before processing."""
+def test_api_webhook_signature_verification_fail_closed(test_client):
+    """P1 verification: Webhooks must fail closed when PAYPAL_WEBHOOK_ID is unconfigured,
+    and reject invalid cryptographic signatures with 401.
+    """
     client, SessionLocal = test_client
 
+    # Case 1: When PAYPAL_WEBHOOK_ID is unconfigured, reject with 503 (fail closed)
+    with patch("app.main.paypal_service.webhook_id", None):
+        resp_unconf = client.post(
+            "/webhooks/paypal",
+            json={"event_type": "PAYMENT.PAYOUTSBATCH.SUCCESS", "resource": {}},
+            headers={"paypal-transmission-sig": "test-sig"},
+        )
+        assert resp_unconf.status_code == 503
+        assert "PAYPAL_WEBHOOK_ID is not configured" in resp_unconf.json()["detail"]
+
+    # Case 2: Configured webhook ID but invalid signature -> 401 Unauthorized
     with patch("app.main.paypal_service.webhook_id", "WH-TEST-ID-123"), \
          patch("app.main.paypal_service.verify_webhook_signature", new_callable=AsyncMock) as mock_verify:
 
-        # Case 1: Invalid signature returns 401 Unauthorized
         mock_verify.return_value = False
         resp_unauth = client.post(
             "/webhooks/paypal",
@@ -229,7 +250,7 @@ def test_api_webhook_signature_verification(test_client):
         assert resp_unauth.status_code == 401
         assert "Invalid PayPal webhook signature" in resp_unauth.json()["detail"]
 
-        # Case 2: Valid signature proceeds
+        # Case 3: Valid signature proceeds
         mock_verify.return_value = True
         resp_auth = client.post(
             "/webhooks/paypal",

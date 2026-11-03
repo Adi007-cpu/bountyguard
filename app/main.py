@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse
 import httpx
 from sqlalchemy.orm import Session
 
+from app.config import AppSettings, get_settings
 from app.database import get_db, init_db
 from app.models import (
     AuditEventModel,
@@ -44,9 +45,6 @@ logger = logging.getLogger(__name__)
 GITHUB_PR_REGEX = re.compile(
     r"^https://github\.com/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+)/pull/([0-9]+)/?$"
 )
-
-# Maintainer token from environment (Fail closed: No insecure defaults!)
-MAINTAINER_TOKEN = os.getenv("MAINTAINER_TOKEN")
 
 
 @asynccontextmanager
@@ -192,16 +190,17 @@ def set_maintainer_approval(
     submission_id: int,
     approval: MaintainerApprovalRequest,
     x_maintainer_token: Optional[str] = Header(None, alias="X-MAINTAINER-TOKEN"),
+    settings: AppSettings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
-    """Protected maintainer sign-off endpoint. Fails closed if MAINTAINER_TOKEN is unset."""
-    if not MAINTAINER_TOKEN or not MAINTAINER_TOKEN.strip():
+    """Protected maintainer sign-off endpoint. Fails closed if MAINTAINER_TOKEN is unset in settings."""
+    if not settings.maintainer_token or not settings.maintainer_token.strip():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Maintainer authentication is not configured on this server (MAINTAINER_TOKEN unset).",
+            detail="Maintainer authentication is not configured on this server (MAINTAINER_TOKEN unset in .env).",
         )
 
-    if not x_maintainer_token or x_maintainer_token != MAINTAINER_TOKEN:
+    if not x_maintainer_token or x_maintainer_token != settings.maintainer_token:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden: Invalid or missing X-MAINTAINER-TOKEN header.",
@@ -347,15 +346,21 @@ async def sync_payout(
 
 
 @app.post("/webhooks/paypal")
-async def paypal_webhook(request: Request, db: Session = Depends(get_db)):
+async def paypal_webhook(
+    request: Request,
+    settings: AppSettings = Depends(get_settings),
+    db: Session = Depends(get_db),
+):
     """Receives and cryptographically verifies asynchronous PayPal webhooks.
     Fails closed: Rejects requests if PAYPAL_WEBHOOK_ID is unconfigured or signature is invalid.
     """
     payload = await request.json()
     headers = dict(request.headers)
 
+    webhook_id = paypal_service.webhook_id or settings.paypal_webhook_id
+
     # Fail closed: Reject if PAYPAL_WEBHOOK_ID is unconfigured
-    if not paypal_service.webhook_id or not paypal_service.webhook_id.strip():
+    if not webhook_id or not webhook_id.strip():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="PAYPAL_WEBHOOK_ID is not configured on this server; unverified webhooks rejected.",

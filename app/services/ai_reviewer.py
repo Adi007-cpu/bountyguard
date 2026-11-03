@@ -46,7 +46,8 @@ class AIReviewer:
         if self._client is not None:
             return self._client
 
-        api_key = os.getenv("GEMINI_API_KEY")
+        from app.config import get_settings
+        api_key = get_settings().gemini_api_key or os.getenv("GEMINI_API_KEY")
         if not api_key or api_key.strip() in ("", "your_gemini_api_key"):
             return None
 

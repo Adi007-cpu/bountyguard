@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.config import AppSettings, get_settings
 from app.database import Base, get_db
 from app.main import app
 from app.models import (
@@ -22,8 +23,7 @@ from app.models import (
 
 
 @pytest.fixture
-def test_client(monkeypatch):
-    monkeypatch.setattr("app.main.MAINTAINER_TOKEN", "test-secret-maintainer-token")
+def test_client():
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -39,9 +39,88 @@ def test_client(monkeypatch):
         finally:
             db.close()
 
+    def override_get_settings():
+        return AppSettings(
+            maintainer_token="test-secret-maintainer-token",
+            paypal_webhook_id="WH-TEST-ID-123",
+        )
+
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_settings] = override_get_settings
     client = TestClient(app)
     yield client, TestingSession
+    app.dependency_overrides.clear()
+
+
+def test_maintainer_token_loaded_from_temporary_dotenv(tmp_path, monkeypatch):
+    """P0 verification: Ensure MAINTAINER_TOKEN is loaded directly from .env via AppSettings,
+    without monkeypatching module globals.
+    """
+    # 1. Create a temporary .env file
+    env_file = tmp_path / ".env"
+    env_file.write_text("MAINTAINER_TOKEN=token-loaded-directly-from-temporary-dotenv\n")
+
+    # 2. Clear any active OS environment variable
+    monkeypatch.delenv("MAINTAINER_TOKEN", raising=False)
+
+    # 3. Instantiate AppSettings pointing to this temporary .env file
+    dotenv_settings = AppSettings(_env_file=str(env_file))
+    assert dotenv_settings.maintainer_token == "token-loaded-directly-from-temporary-dotenv"
+
+    # 4. Wire settings into app dependency without monkeypatching module variables
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    def override_db():
+        db = TestingSession()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_settings] = lambda: dotenv_settings
+
+    client = TestClient(app)
+
+    # Setup bounty and submission
+    db = TestingSession()
+    bounty = BountyModel(title="Test", amount=Decimal("100.00"), currency="USD")
+    db.add(bounty)
+    db.commit()
+    sub = SubmissionModel(
+        bounty_id=bounty.id,
+        contributor_email="dev@example.com",
+        pr_url="https://github.com/example/repo/pull/1",
+        code_diff="def ok(): pass",
+    )
+    db.add(sub)
+    db.commit()
+    sub_id = sub.id
+    db.close()
+
+    # 5. Call maintainer approval using the token loaded from .env
+    resp = client.post(
+        f"/submissions/{sub_id}/maintainer-approval",
+        headers={"X-MAINTAINER-TOKEN": "token-loaded-directly-from-temporary-dotenv"},
+        json={"approved": True, "notes": "Verified from temporary .env file"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["maintainer_approved"] is True
+
+    # 6. Invalid token is rejected
+    bad_resp = client.post(
+        f"/submissions/{sub_id}/maintainer-approval",
+        headers={"X-MAINTAINER-TOKEN": "wrong-token"},
+        json={"approved": True},
+    )
+    assert bad_resp.status_code == 403
+
     app.dependency_overrides.clear()
 
 
@@ -228,6 +307,10 @@ def test_api_webhook_signature_verification_fail_closed(test_client):
     client, SessionLocal = test_client
 
     # Case 1: When PAYPAL_WEBHOOK_ID is unconfigured, reject with 503 (fail closed)
+    def override_no_webhook_settings():
+        return AppSettings(maintainer_token="test", paypal_webhook_id=None)
+
+    app.dependency_overrides[get_settings] = override_no_webhook_settings
     with patch("app.main.paypal_service.webhook_id", None):
         resp_unconf = client.post(
             "/webhooks/paypal",
@@ -238,6 +321,10 @@ def test_api_webhook_signature_verification_fail_closed(test_client):
         assert "PAYPAL_WEBHOOK_ID is not configured" in resp_unconf.json()["detail"]
 
     # Case 2: Configured webhook ID but invalid signature -> 401 Unauthorized
+    def override_webhook_settings():
+        return AppSettings(maintainer_token="test", paypal_webhook_id="WH-TEST-ID-123")
+
+    app.dependency_overrides[get_settings] = override_webhook_settings
     with patch("app.main.paypal_service.webhook_id", "WH-TEST-ID-123"), \
          patch("app.main.paypal_service.verify_webhook_signature", new_callable=AsyncMock) as mock_verify:
 

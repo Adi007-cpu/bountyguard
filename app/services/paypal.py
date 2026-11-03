@@ -39,8 +39,15 @@ class PayPalSettings(BaseSettings):
 
 
 class PayPalService:
-    def __init__(self, settings: Optional[PayPalSettings] = None):
-        self.settings = settings or PayPalSettings()
+    def __init__(self, settings: Optional[Any] = None):
+        if settings is None:
+            try:
+                from app.config import get_settings
+                self.settings = get_settings()
+            except Exception:
+                self.settings = PayPalSettings()
+        else:
+            self.settings = settings
         self.client_id = self.settings.paypal_client_id
         self.client_secret = self.settings.paypal_client_secret
         self.webhook_id = self.settings.paypal_webhook_id

@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.config import AppSettings, get_settings
 from app.database import Base, get_db
 from app.main import app
 from app.models import (
@@ -27,8 +28,7 @@ from app.services.policy import PolicyEngine
 
 
 @pytest.fixture
-def test_env(monkeypatch):
-    monkeypatch.setattr("app.main.MAINTAINER_TOKEN", "scenario-maintainer-secret")
+def test_env():
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -44,7 +44,11 @@ def test_env(monkeypatch):
         finally:
             db.close()
 
+    def override_settings():
+        return AppSettings(maintainer_token="scenario-maintainer-secret")
+
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_settings] = override_settings
     client = TestClient(app)
     session = TestingSession()
     yield client, session

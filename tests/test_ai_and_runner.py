@@ -67,6 +67,35 @@ def test_ai_reviewer_fails_closed_when_gemini_unavailable(db):
     assert "GEMINI_API_KEY is not configured" in review.summary
 
 
+def test_ai_reviewer_client_receives_api_key_from_dotenv(tmp_path, monkeypatch):
+    """P0 verification: Ensure genai.Client receives explicit api_key loaded from .env via AppSettings,
+    without relying on process environment variable auto-detection.
+    """
+    from unittest.mock import patch
+    from app.config import get_settings
+
+    # 1. Create a temporary .env file with the Gemini API key
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_API_KEY=explicit-gemini-key-from-dotenv\n")
+
+    # 2. Clear GEMINI_API_KEY from os.environ to prove genai.Client receives the explicit parameter
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    # 3. Change directory to tmp_path and clear cached settings
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+
+    try:
+        with patch("google.genai.Client") as mock_genai_client:
+            reviewer = AIReviewer()
+            client = reviewer._get_client()
+
+            assert client == mock_genai_client.return_value
+            mock_genai_client.assert_called_once_with(api_key="explicit-gemini-key-from-dotenv")
+    finally:
+        get_settings.cache_clear()
+
+
 def test_ai_reviewer_static_scan_catches_malicious_code(db):
     bounty = BountyModel(
         title="Fix authentication bug",

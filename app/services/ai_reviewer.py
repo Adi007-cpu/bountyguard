@@ -38,22 +38,29 @@ class AIReviewer:
         "/bin/bash",
     ]
 
-    def __init__(self, model: str = "gemini-3.8-flash", client: Optional[Any] = None):
+    def __init__(
+        self,
+        model: str = "gemini-3.8-flash",
+        client: Optional[Any] = None,
+        settings: Optional[Any] = None,
+    ):
         self.model = model
         self._client = client
+        self._settings = settings
 
     def _get_client(self) -> Optional[Any]:
         if self._client is not None:
             return self._client
 
         from app.config import get_settings
-        api_key = get_settings().gemini_api_key or os.getenv("GEMINI_API_KEY")
+        settings = self._settings or get_settings()
+        api_key = settings.gemini_api_key or os.getenv("GEMINI_API_KEY")
         if not api_key or api_key.strip() in ("", "your_gemini_api_key"):
             return None
 
         try:
             from google import genai
-            self._client = genai.Client()
+            self._client = genai.Client(api_key=api_key)
             return self._client
         except Exception as e:
             logger.warning(f"Failed to initialize google-genai Client: {e}")

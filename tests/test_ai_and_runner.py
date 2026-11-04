@@ -55,7 +55,8 @@ def test_ai_reviewer_fails_closed_when_gemini_unavailable(db):
     db.commit()
 
     # AIReviewer without client or GEMINI_API_KEY
-    reviewer = AIReviewer(client=None)
+    from app.config import AppSettings
+    reviewer = AIReviewer(client=None, settings=AppSettings(gemini_api_key=None))
     # Ensure no environment variable intervenes
     with pytest.MonkeyPatch().context() as mp:
         mp.delenv("GEMINI_API_KEY", raising=False)

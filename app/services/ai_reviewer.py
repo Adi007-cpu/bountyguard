@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 from decimal import Decimal
 from typing import Any, Optional
 from sqlalchemy.orm import Session
@@ -16,6 +17,44 @@ from app.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Models are tried in this order. Each model has its own free-tier daily quota,
+# so a chain gives more free requests and survives a 429 / 404 on one model.
+MODEL_CHAIN = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+]
+CALL_TIMEOUT_SECONDS = 15
+
+
+def _create_with_timeout(client: Any, model: str, prompt: str, timeout: float) -> Any:
+    """Run the Gemini call in a daemon thread so a hang can't block the server."""
+    result: dict = {}
+
+    def worker() -> None:
+        try:
+            result["value"] = client.interactions.create(
+                model=model,
+                input=prompt,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": AIReviewAssessment.model_json_schema(),
+                },
+            )
+        except Exception as e:
+            result["error"] = e
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"{model} did not respond within {timeout}s")
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
 
 
 class AIReviewer:
@@ -40,7 +79,7 @@ class AIReviewer:
 
     def __init__(
         self,
-        model: str = "gemini-3.8-flash",
+        model: str = "gemini-3.1-flash-lite",
         client: Optional[Any] = None,
         settings: Optional[Any] = None,
     ):
@@ -140,15 +179,24 @@ Instructions:
 5. Provide a clear summary and detailed findings.
 """
         try:
-            interaction = client.interactions.create(
-                model=self.model,
-                input=prompt,
-                response_format={
-                    "type": "text",
-                    "mime_type": "application/json",
-                    "schema": AIReviewAssessment.model_json_schema(),
-                },
-            )
+            # Try the primary model first, then each model in the chain.
+            # A timeout, 429 (quota), 404 (not found) or any other error moves
+            # on to the next model instead of hanging.
+            models_to_try = [self.model] + [m for m in MODEL_CHAIN if m != self.model]
+            interaction = None
+            errors: list[str] = []
+            for model_name in models_to_try:
+                try:
+                    interaction = _create_with_timeout(
+                        client, model_name, prompt, CALL_TIMEOUT_SECONDS
+                    )
+                    break
+                except Exception as err:
+                    logger.warning(f"Model {model_name} failed, trying next: {err}")
+                    errors.append(f"{model_name}: {str(err)[:150]}")
+            if interaction is None:
+                raise RuntimeError("All Gemini models failed. " + " | ".join(errors))
+
             output_text = interaction.output_text
             if not output_text:
                 raise ValueError("Gemini API returned empty output_text.")

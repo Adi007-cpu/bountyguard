@@ -267,3 +267,90 @@ def test_scenario_3_malicious_submission_zero_paypal_calls(test_env):
         payout_attempt = client.post("/payout/execute", json={"submission_id": sub_id})
         assert payout_attempt.status_code == 400
         assert mock_payout.call_count == 0
+
+
+def test_scenario_4_ai_approves_but_policy_blocks_without_maintainer_approval(test_env):
+    """Scenario 4: AI approval is insufficient; maintainer sign-off is still required.
+
+    This is the core safety guarantee: policy remains the authority that permits
+    money movement, even after a valid submission passes verification and AI review.
+    """
+    client, _ = test_env
+
+    # 1. A maintainer defines a bounty with deterministic acceptance criteria.
+    bounty_resp = client.post(
+        "/bounties",
+        json={
+            "title": "Implement RateLimiter middleware",
+            "description": "Sliding window rate limiter with check_rate_limit.",
+            "amount": 350.00,
+            "currency": "USD",
+            "acceptance_criteria": {
+                "required_symbols": ["RateLimiter", "check_rate_limit"],
+                "min_score": 0.90,
+            },
+        },
+    )
+    assert bounty_resp.status_code == 201
+    bounty_id = bounty_resp.json()["id"]
+
+    # 2. The contributor submits a valid implementation.
+    sub_resp = client.post(
+        "/submissions",
+        json={
+            "bounty_id": bounty_id,
+            "contributor_email": "approved_by_ai@example.com",
+            "pr_url": "https://github.com/example/repo/pull/104",
+            "code_diff": GOOD_DIFF,
+            "commit_sha": "c4d5e6f7a8b9c0d1",
+        },
+    )
+    assert sub_resp.status_code == 201
+    sub_id = sub_resp.json()["id"]
+
+    # 3. Deterministic verification passes.
+    verification = client.post(f"/submissions/{sub_id}/run-tests")
+    assert verification.status_code == 200
+    assert verification.json()["all_passed"] is True
+
+    # 4. Gemini recommends approval with a score that exceeds the maintainer threshold.
+    from unittest.mock import MagicMock
+
+    mock_gemini = MagicMock()
+    mock_interaction = MagicMock()
+    mock_interaction.output_text = """{
+        "verdict": "approved",
+        "score": 0.95,
+        "summary": "The implementation meets the bounty requirements.",
+        "security_checks_passed": true,
+        "spec_requirements_met": true
+    }"""
+    mock_gemini.interactions.create.return_value = mock_interaction
+
+    with patch("app.main.ai_reviewer._get_client", return_value=mock_gemini):
+        ai_review = client.post(f"/submissions/{sub_id}/ai-review")
+    assert ai_review.status_code == 200
+    assert ai_review.json()["verdict"] == "approved"
+    assert ai_review.json()["score"] == "0.95"
+
+    # 5. Deliberately skip maintainer sign-off.
+    submission = client.get(f"/submissions/{sub_id}").json()
+    assert submission["maintainer_approved"] is False
+
+    # 6. The deterministic policy blocks the payout despite an AI approval.
+    evaluation = client.post("/policy/evaluate", json={"submission_id": sub_id})
+    assert evaluation.status_code == 200
+    assert evaluation.json()["allowed"] is False
+    assert any(
+        "Maintainer approval has not been granted" in reason
+        for reason in evaluation.json()["reasons"]
+    )
+
+    # 7. A denied policy decision makes zero PayPal calls.
+    with patch(
+        "app.main.payout_orchestrator.paypal_service.create_payout",
+        new_callable=AsyncMock,
+    ) as mock_payout:
+        payout_attempt = client.post("/payout/execute", json={"submission_id": sub_id})
+    assert payout_attempt.status_code == 400
+    assert mock_payout.call_count == 0

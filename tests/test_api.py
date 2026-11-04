@@ -20,7 +20,24 @@ from app.models import (
     SubmissionModel,
     SubmissionStatus,
 )
+from unittest.mock import MagicMock, patch
+from app.models import AIReviewAssessment, ReviewVerdict
 
+
+def _fake_gemini_client():
+    assessment = AIReviewAssessment(
+        verdict=ReviewVerdict.APPROVED,
+        score=0.95,
+        summary="Mocked review: change addresses the bounty.",
+        security_checks_passed=True,
+        spec_requirements_met=True,
+        details={},
+    )
+    interaction = MagicMock()
+    interaction.output_text = assessment.model_dump_json()
+    client = MagicMock()
+    client.interactions.create.return_value = interaction
+    return client
 
 @pytest.fixture
 def test_client():
@@ -182,8 +199,9 @@ def test_api_bounty_and_submission_lifecycle(test_client):
     assert test_run_resp.status_code == 200
     assert test_run_resp.json()["all_passed"] is True
 
-    # 6. Run AI review
-    ai_rev_resp = client.post(f"/submissions/{sub_id}/ai-review")
+        # 6. Run AI review (mocked, never call the live model in tests)
+    with patch("app.main.ai_reviewer._get_client", return_value=_fake_gemini_client()):
+        ai_rev_resp = client.post(f"/submissions/{sub_id}/ai-review")
     assert ai_rev_resp.status_code == 200
     assert ai_rev_resp.json()["verdict"] in ("approved", "changes_requested")
 

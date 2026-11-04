@@ -515,7 +515,7 @@ def get_dashboard():
             <span id="badge-ci" class="text-xs font-mono px-2 py-0.5 rounded bg-gray-800 text-gray-400">Pending</span>
           </div>
           <div class="flex items-center justify-between p-2.5 bg-gray-950/60 rounded-lg border border-gray-800/60">
-            <span class="text-gray-300 flex items-center gap-2"><i class="fa-solid fa-robot text-gray-500"></i> Gemini 3.8 Flash AI Review</span>
+            <span class="text-gray-300 flex items-center gap-2"><i class="fa-solid fa-robot text-gray-500"></i> Gemini AI Review</span>
             <span id="badge-ai" class="text-xs font-mono px-2 py-0.5 rounded bg-gray-800 text-gray-400">Pending</span>
           </div>
           <div class="flex items-center justify-between p-2.5 bg-gray-950/60 rounded-lg border border-gray-800/60">

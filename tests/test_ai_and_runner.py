@@ -177,7 +177,7 @@ def test_ai_reviewer_with_gemini_llm_structured_output(db):
     # Verify LLM was invoked with structured response_format
     assert mock_client.interactions.create.called
     call_kwargs = mock_client.interactions.create.call_args.kwargs
-    assert call_kwargs["model"] == "gemini-3.8-flash"
+    assert call_kwargs["model"] == reviewer.model
     assert "response_format" in call_kwargs
     assert call_kwargs["response_format"]["mime_type"] == "application/json"
 

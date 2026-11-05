@@ -17,23 +17,52 @@ logger = logging.getLogger(__name__)
 # --- Scenario Code Diffs ---
 
 GOOD_DIFF = """
+import threading
+import time
+from collections import deque
+
+
 class RateLimiter:
-    def __init__(self, max_requests: int = 100, window_seconds: int = 60):
+    def __init__(self, max_requests: int = 100, window_seconds: int = 60, max_tracked_clients: int = 10000):
+        if max_requests <= 0 or window_seconds <= 0:
+            raise ValueError("max_requests and window_seconds must be positive")
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self.history = {}
+        self.max_tracked_clients = max_tracked_clients
+        self._history = {}
+        self._lock = threading.Lock()
+
+    def _prune(self, calls, now):
+        # Drop timestamps that fell out of the sliding window.
+        cutoff = now - self.window_seconds
+        while calls and calls[0] <= cutoff:
+            calls.popleft()
+
+    def _purge_idle_clients(self, now):
+        # Remove clients with no calls left in the window so memory stays bounded.
+        for client in list(self._history):
+            calls = self._history[client]
+            self._prune(calls, now)
+            if not calls:
+                del self._history[client]
 
     def check_rate_limit(self, client_ip: str) -> bool:
-        \"\"\"Validates client request rate against sliding window threshold.\"\"\"
-        import time
-        now = time.time()
-        calls = self.history.get(client_ip, [])
-        calls = [t for t in calls if now - t < self.window_seconds]
-        if len(calls) >= self.max_requests:
-            return False
-        calls.append(now)
-        self.history[client_ip] = calls
-        return True
+        # Sliding window: allow only if fewer than max_requests calls happened in the window.
+        now = time.monotonic()
+        with self._lock:
+            calls = self._history.get(client_ip)
+            if calls is None:
+                if len(self._history) >= self.max_tracked_clients:
+                    self._purge_idle_clients(now)
+                    if len(self._history) >= self.max_tracked_clients:
+                        return False  # fail closed when the tracking table is full
+                calls = deque()
+                self._history[client_ip] = calls
+            self._prune(calls, now)
+            if len(calls) >= self.max_requests:
+                return False
+            calls.append(now)
+            return True
 """.strip()
 
 BROKEN_DIFF = """
@@ -80,7 +109,7 @@ def seed_demo_scenarios(db: Session) -> dict[str, Any]:
 
     sub_good = SubmissionModel(
         bounty_id=bounty_good.id,
-        contributor_email="top_contributor@example.com",
+        contributor_email="sb-uspn753249270@personal.example.com",
         pr_url="https://github.com/example/repo/pull/101",
         code_diff=GOOD_DIFF,
         commit_sha="a1b2c3d4e5f67890",

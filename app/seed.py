@@ -16,6 +16,20 @@ logger = logging.getLogger(__name__)
 
 # --- Scenario Code Diffs ---
 
+def _demo_recipient() -> str:
+    """Email that receives the demo payout. Set DEMO_RECIPIENT_EMAIL in .env to a
+    US PayPal sandbox Personal account email that you own."""
+    import os
+    value = os.getenv("DEMO_RECIPIENT_EMAIL")
+    if not value:
+        try:
+            from dotenv import dotenv_values
+            value = dotenv_values(".env").get("DEMO_RECIPIENT_EMAIL")
+        except Exception:
+            value = None
+    return value or "demo_contributor@example.com"
+
+
 GOOD_DIFF = """
 import threading
 import time
@@ -109,7 +123,7 @@ def seed_demo_scenarios(db: Session) -> dict[str, Any]:
 
     sub_good = SubmissionModel(
         bounty_id=bounty_good.id,
-        contributor_email="sb-uspn753249270@personal.example.com",
+        contributor_email=_demo_recipient(),
         pr_url="https://github.com/example/repo/pull/101",
         code_diff=GOOD_DIFF,
         commit_sha="a1b2c3d4e5f67890",

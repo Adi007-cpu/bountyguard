@@ -421,7 +421,7 @@ def seed_demo(db: Session = Depends(get_db)):
 @app.get("/dashboard", response_class=HTMLResponse)
 def get_dashboard():
     """Renders the secure BountyGuard Mission Control dashboard."""
-    html_content = """<!DOCTYPE html>
+    html_content = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">

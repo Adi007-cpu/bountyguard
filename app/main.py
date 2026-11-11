@@ -414,6 +414,9 @@ def get_audit_events(
 @app.post("/seed")
 def seed_demo(db: Session = Depends(get_db)):
     """Seeds the three demo scenarios without pre-approvals so the full live flow can be demonstrated."""
+    from app.models import BountyModel
+    if db.query(BountyModel).count() > 0:
+        return {"status": "already_seeded", "scenarios": {}}
     summary = seed_demo_scenarios(db)
     return {"status": "seeded", "scenarios": summary}
 
@@ -768,6 +771,13 @@ def get_dashboard():
     async function triggerSeed() {
       const res = await fetch('/seed', { method: 'POST' });
       const data = await res.json();
+      if (data.status === 'already_seeded') {
+        alert('Demo data is already loaded. Nothing was added.');
+        loadBounties();
+        loadSubmissions();
+        loadAuditEvents();
+        return;
+      }
       alert('Seeded 3 Scenarios (bounties & raw submissions only, without pre-approvals):\n1. Good Submission (RateLimiter)\n2. Broken Submission (StreamParser)\n3. Malicious Submission (WebhookDispatcher)\n\nClick the verification and AI review buttons to run the live workflow!');
       loadBounties();
       loadSubmissions();

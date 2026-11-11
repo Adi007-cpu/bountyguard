@@ -28,7 +28,7 @@ from app.models import (
     SubmissionModel,
     SubmissionRead,
 )
-from app.seed import seed_demo_scenarios
+from app.seed import seed_demo_scenarios, seed_if_empty
 from app.services.ai_reviewer import AIReviewer
 from app.services.paypal import PayPalPayoutError, PayPalService, PayPalWebhookVerificationError
 from app.services.payout_orchestrator import (
@@ -50,6 +50,8 @@ GITHUB_PR_REGEX = re.compile(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    if os.getenv("AUTO_SEED") == "1":
+        seed_if_empty()
     yield
 
 

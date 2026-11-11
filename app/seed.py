@@ -283,3 +283,15 @@ if __name__ == "__main__":
         print(json.dumps(summary, indent=2))
     finally:
         db.close()
+
+
+def seed_if_empty() -> bool:
+    """Seed demo data only when the bounties table is empty. Returns True if it seeded."""
+    db = SessionLocal()
+    try:
+        if db.query(BountyModel).count() > 0:
+            return False
+        seed_demo_scenarios(db)
+        return True
+    finally:
+        db.close()

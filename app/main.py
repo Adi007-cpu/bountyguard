@@ -455,7 +455,7 @@ def get_dashboard():
     <div class="flex items-center space-x-3">
       <button onclick="triggerSeed()" class="px-4 py-2 bg-indigo-600/30 hover:bg-indigo-600/50 border border-indigo-500/30 text-indigo-300 rounded-lg text-sm font-semibold transition flex items-center space-x-2">
         <i class="fa-solid fa-wand-magic-sparkles"></i>
-        <span>Seed 3 Demo Scenarios</span>
+        <span>Seed Demo Scenarios</span>
       </button>
       <a href="/docs" target="_blank" class="px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm transition">
         <i class="fa-solid fa-book-open mr-1"></i> API Docs

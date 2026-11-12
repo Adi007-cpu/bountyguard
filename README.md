@@ -2,11 +2,35 @@
 
 Automated server-side policy guardrails, Gemini LLM AI code review, and secure asynchronous PayPal payouts for developer bounties.
 
+## Live demo
+
+**https://bountyguard.onrender.com/dashboard**
+
+- First load after idle takes 30 to 60 seconds (free Render plan sleeps). Open it a minute before testing.
+- Demo data resets whenever the service restarts, and the 4 scenarios are re-seeded automatically.
+- Maintainer token for the demo: `bountyguard-demo-2026` (throwaway, sandbox only).
+- If the Gemini free-tier quota is exhausted, the AI review fails closed to "human review required" by design. The demo video shows the full flow.
+
+## How it works
+
+Submission, then verification (AST and symbol checks), then Gemini AI review, then the policy engine, then maintainer sign-off, then PayPal payout (sandbox).
+
+The AI can recommend, but a separate deterministic policy engine can still block the payout, and the system fails closed whenever a check or service is unavailable.
+
+## Demo scenarios
+
+1. **Good submission** (RateLimiter): passes verification and review, can be approved and paid.
+2. **Broken submission** (StreamParser): fails verification.
+3. **Malicious submission** (WebhookDispatcher): blocked by the static security pre-check.
+4. **AI approves, policy blocks**: the AI review passes but the policy engine denies the payout, with zero PayPal calls.
+
+To try it: open the dashboard, pick a submission, run verification, run the Gemini AI review, approve with the maintainer token, then execute the payout.
+
 ## Architecture & Security Highlights
 
 - **Server-Side Trust Boundary & Immutable Submissions**: Submissions store the immutable code diff (`code_diff`) and commit SHA upon creation. Neither `/submissions/{id}/run-tests` nor `/submissions/{id}/ai-review` accept caller-supplied code diffs or test contexts.
 - **SSRF-Protected PR Diff Fetching**: Automated pull request diff fetching strictly validates URLs matching `https://github.com/<owner>/<repo>/pull/<number>` before resolving patches, preventing Server-Side Request Forgery.
-- **Real Gemini LLM Code Review**: Uses the Google GenAI SDK (`gemini-3.8-flash`) with structured JSON schema output (`AIReviewAssessment`). Evaluates the submitted code against the bounty's title, description, and requirements, while retaining a deterministic static analysis pre-check for dangerous operations (`eval`, `os.system`, shell execution). Fails closed if the LLM is unavailable.
+- **Real Gemini LLM Code Review**: Uses the Google GenAI SDK with automatic failover across four Gemini models (each falls back to the previous one when a model is exhausted or times out) with structured JSON schema output (`AIReviewAssessment`). Evaluates the submitted code against the bounty's title, description, and requirements, while retaining a deterministic static analysis pre-check for dangerous operations (`eval`, `os.system`, shell execution). Fails closed if the LLM is unavailable.
 - **Maintainer Acceptance Criteria Enforcement**: Maintainers specify `required_symbols`, `forbidden_symbols`, and `min_score` upon creating bounties. The verification suite enforces symbol constraints, and the policy engine enforces quality score thresholds.
 - **Protected Maintainer Sign-Off**: The `POST /submissions/{id}/maintainer-approval` endpoint requires authentication via `X-MAINTAINER-TOKEN` and fails closed if unconfigured.
 - **Asynchronous PayPal Payout Lifecycle**: Payouts are created in `PENDING` status. Funds and bounties are never marked `PAID` prematurely—only after verifying batch status via `POST /payout/{id}/sync` or receiving PayPal webhooks (`POST /webhooks/paypal`).
@@ -28,7 +52,7 @@ bountyguard/
 │   ├── database.py                 # SQLAlchemy engine, session factory, and DB initialization
 │   ├── main.py                     # FastAPI application endpoints, dashboard & lifespan handler
 │   ├── models.py                   # SQLAlchemy ORM models and Pydantic schemas (Decimal)
-│   ├── seed.py                     # Seed script for the 3 demo scenarios
+│   ├── seed.py                     # Seed script for the 4 demo scenarios
 │   └── services/
 │       ├── ai_reviewer.py          # Gemini LLM code reviewer + static security scanner
 │       ├── paypal.py               # PayPal client with batch creation, query, timeouts & webhooks
@@ -40,7 +64,7 @@ bountyguard/
 │   ├── test_api.py                 # FastAPI integration, anti-tampering, SSRF guard & webhooks
 │   ├── test_payout.py              # Zero-call denial, concurrency race & retry reconciliation
 │   ├── test_policy.py              # Server-side policy rule unit tests
-│   └── test_scenarios.py           # End-to-end tests for the 3 seeded scenarios
+│   └── test_scenarios.py           # End-to-end tests for the seeded scenarios
 ├── .env.example                    # Template for environment variables
 ├── .gitignore                      # Git ignored patterns
 ├── LICENSE                         # MIT License
@@ -79,12 +103,14 @@ cp .env.example .env
 ```env
 PAYPAL_CLIENT_ID=your_sandbox_client_id
 PAYPAL_CLIENT_SECRET=your_sandbox_client_secret
-PAYPAL_WEBHOOK_ID=your_sandbox_webhook_id
+PAYPAL_WEBHOOK_ID=   # optional, only for payout webhooks
 PAYPAL_API_BASE=https://api-m.sandbox.paypal.com
 DATABASE_URL=sqlite:///./bountyguard.db
 GEMINI_API_KEY=your_gemini_api_key
 MAINTAINER_TOKEN=your_secure_maintainer_token
 APP_ENV=development
+DEMO_RECIPIENT_EMAIL=sb-your-personal-account@personal.example.com
+AUTO_SEED=1   # optional: seed demo data on startup when the DB is empty
 ```
 
 ---
@@ -109,3 +135,16 @@ uvicorn app.main:app --reload
 
 - **Interactive Mission Control Dashboard**: [http://127.0.0.1:8000/dashboard](http://127.0.0.1:8000/dashboard)
 - **Interactive Swagger API Docs**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+---
+
+## PayPal sandbox requirements
+
+- **Sandbox only.** No live payments are made.
+- Use a **Merchant app linked to a US sandbox Business account**, otherwise Payouts can fail with `PAYOUT_NOT_AVAILABLE`.
+- Set `DEMO_RECIPIENT_EMAIL` to a **US sandbox Personal account you own**. The demo payout is sent there. If it is unset, the payout will not reach a real sandbox account.
+- Payouts are asynchronous: they start as `PENDING` and are only marked `PAID` after PayPal confirms the batch status.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
